@@ -1,0 +1,21 @@
+[package]
+name = "shotctl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A keyboard-driven photo import and archive manager"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+chrono = "0.4"
+crossterm = "0.29"
+dirs = "6"
+filetime = "0.2"
+kamadak-exif = "0.6"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+tempfile = "3"
+walkdir = "2"
