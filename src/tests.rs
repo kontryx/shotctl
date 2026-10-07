@@ -92,6 +92,76 @@ fn first_import_verifies_bytes_and_second_import_skips_duplicates() {
 }
 
 #[test]
+fn scans_prune_system_folders_and_keep_ordinary_hidden_photo_folders() {
+    let (temp, config) = fixture();
+    let card = temp.path().join("card");
+    fs::write(card.join("DCIM/100CAM/photo.JPG"), b"camera photo").unwrap();
+    fs::create_dir(card.join(".hidden-shoot")).unwrap();
+    fs::write(card.join(".hidden-shoot/hidden.JPG"), b"hidden photo").unwrap();
+    let system_folders = [
+        ".Trashes",
+        ".Spotlight-V100",
+        ".fseventsd",
+        ".TemporaryItems",
+        ".DocumentRevisions-V100",
+        "$RECYCLE.BIN",
+        "System Volume Information",
+    ];
+    for name in system_folders {
+        let directory = card.join(name).join("nested");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("unwanted.JPG"), b"discarded photo").unwrap();
+    }
+    let preview = plan(&card, &config);
+    assert_eq!(preview.copy_count(), 2);
+    assert_eq!(preview.skipped_entries, system_folders.len());
+    assert!(
+        preview
+            .photos
+            .iter()
+            .all(|photo| photo.source.file_name().unwrap() != "unwanted.JPG")
+    );
+    assert!(
+        preview
+            .photos
+            .iter()
+            .any(|photo| photo.source.ends_with(".hidden-shoot/hidden.JPG"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn protected_trash_does_not_block_scans_but_unreadable_photo_folders_do() {
+    use std::os::unix::fs::PermissionsExt;
+    let (temp, config) = fixture();
+    let card = temp.path().join("card");
+    fs::write(card.join("DCIM/100CAM/photo.JPG"), b"camera photo").unwrap();
+    let trash = card.join(".Trashes");
+    fs::create_dir(&trash).unwrap();
+    fs::write(trash.join("deleted.JPG"), b"deleted photo").unwrap();
+    let original_permissions = fs::metadata(&trash).unwrap().permissions();
+    fs::set_permissions(&trash, fs::Permissions::from_mode(0o0)).unwrap();
+    let (tx, _rx) = mpsc::channel();
+    let result = import::build_plan(&card, &config, &tx, &AtomicBool::new(false));
+    fs::set_permissions(&trash, original_permissions).unwrap();
+    let preview = result.unwrap();
+    assert_eq!(preview.copy_count(), 1);
+    assert_eq!(preview.skipped_entries, 1);
+
+    let shoot = card.join("Unreadable Shoot");
+    fs::create_dir(&shoot).unwrap();
+    fs::write(shoot.join("photo.JPG"), b"another photo").unwrap();
+    let original_permissions = fs::metadata(&shoot).unwrap().permissions();
+    fs::set_permissions(&shoot, fs::Permissions::from_mode(0o0)).unwrap();
+    let permission_denied = fs::read_dir(&shoot).is_err();
+    let result = import::build_plan(&card, &config, &tx, &AtomicBool::new(false));
+    fs::set_permissions(&shoot, original_permissions).unwrap();
+    if permission_denied {
+        assert!(format!("{:#}", result.unwrap_err()).contains("Unreadable Shoot"));
+    }
+}
+
+#[test]
 fn filename_conflicts_are_stable_and_never_overwrite() {
     let (temp, mut config) = fixture();
     config.grouping = Grouping::Together;
@@ -303,11 +373,12 @@ fn terminal_screens_keep_configuration_and_setup_controls_visible() {
     app.draft = config.clone();
     app.archive_input = config.archive.display().to_string();
     app.plan = Some(plan(&card, &config));
+    app.import_archive = Some(config.archive.clone());
     app.summary = Some(import::Summary {
         copied: 1,
         ..import::Summary::default()
     });
-    for (width, height) in [(66, 22), (80, 24), (120, 40)] {
+    for (width, height) in [(66, 22), (80, 24), (120, 30), (120, 40)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         for screen in [
             Screen::Settings,
@@ -328,6 +399,32 @@ fn terminal_screens_keep_configuration_and_setup_controls_visible() {
                 text.push('\n');
             }
             assert!(text.contains("Archive") && text.contains("Layout") && text.contains("Dates"));
+            if screen == Screen::Done {
+                assert!(
+                    text.contains("[o] Open archive"),
+                    "Open archive shortcut hidden at {width}×{height}:\n{text}"
+                );
+                for (cancelled, failed) in [(true, 0), (false, 1)] {
+                    let summary = app.summary.as_mut().unwrap();
+                    summary.cancelled = cancelled;
+                    summary.failed = failed;
+                    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let text = (0..height)
+                        .map(|y| {
+                            (0..width)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(!text.contains("[o] Open archive"));
+                    assert!(!text.contains("Press o to open"));
+                }
+                let summary = app.summary.as_mut().unwrap();
+                summary.cancelled = false;
+                summary.failed = 0;
+            }
             if screen == Screen::Settings {
                 assert!(
                     text.contains("Save configuration"),
@@ -363,6 +460,85 @@ fn terminal_screens_keep_configuration_and_setup_controls_visible() {
         app.source_input = Some("/Volumes/CAMERA".into());
         terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
         app.source_input = None;
+        app.screen = Screen::Settings;
+        app.directory_browser = Some(
+            crate::directories::DirectoryBrowser::open(temp.path().to_str().unwrap()).unwrap(),
+        );
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Browse archive folders",
+            "archive/",
+            "card/",
+            "Space use current",
+            "Tab use selected",
+            "Esc cancel",
+            "Backspace parent",
+            "[n] New folder here",
+        ] {
+            assert!(
+                text.contains(expected),
+                "Browser control hidden at {width}×{height}: {expected}\n{text}"
+            );
+        }
+        let footer = (0..width)
+            .map(|x| buffer[(x, height - 2)].symbol())
+            .collect::<String>();
+        assert!(
+            footer.contains("[n] New folder here"),
+            "New-folder shortcut missing from footer at {width}×{height}:\n{text}"
+        );
+        assert_eq!(text.matches("[n] New folder here").count(), 1);
+        assert!(!text.contains("Complete path"));
+        for expected in [
+            "[↑↓] Select",
+            "[Enter/→] Open",
+            "[←/Backspace] Parent",
+            "[Space] Use current",
+            "[Tab] Use selected",
+            "[Esc] Cancel",
+        ] {
+            assert!(
+                text.contains(expected),
+                "Browser shortcut obscured at {width}×{height}: {expected}\n{text}"
+            );
+        }
+        let browser = app.directory_browser.as_mut().unwrap();
+        browser.new_folder_input = Some("New Photo Archive".into());
+        browser.error = "A file or folder named 'Existing' already exists.".into();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Create new folder",
+            "Create inside:",
+            "Folder name:",
+            "New Photo Archive",
+            "already exists",
+            "[Enter] Create & open",
+            "[Esc] Cancel",
+        ] {
+            assert!(
+                text.contains(expected),
+                "New folder control hidden at {width}×{height}: {expected}\n{text}"
+            );
+        }
+        app.directory_browser = None;
     }
     let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();

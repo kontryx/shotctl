@@ -8,6 +8,7 @@ use ratatui::{
 
 use crate::{
     app::{App, Screen},
+    directories::DirectoryBrowser,
     import::{Action, human_bytes},
 };
 
@@ -36,6 +37,93 @@ fn border(title: &str) -> Block<'_> {
         .style(Style::default().bg(PANEL).fg(TEXT))
 }
 
+fn shortcut_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let shortcuts: &[(&str, &str)] = if let Some(browser) = &app.directory_browser {
+        if browser.new_folder_input.is_some() {
+            &[("Enter", "Create folder"), ("Esc", "Cancel")]
+        } else {
+            &[
+                ("↑↓", "Select"),
+                ("Enter/→", "Open"),
+                ("←/Backspace", "Parent"),
+                ("Space", "Use current"),
+                ("Tab", "Use selected"),
+                ("Esc", "Cancel"),
+                ("n", "New folder here"),
+            ]
+        }
+    } else {
+        match app.screen {
+            Screen::Settings if app.field == 0 => &[
+                ("Tab", "Complete path"),
+                ("Enter", "Browse folders"),
+                ("↑↓", "Change field"),
+                ("Ctrl+S", "Save"),
+                ("Esc", "Cancel"),
+            ],
+            Screen::Settings => &[
+                ("Tab/↑↓", "Change field"),
+                ("←→", "Change option"),
+                ("Ctrl+S", "Save"),
+                ("Esc", "Cancel"),
+            ],
+            Screen::Sources => &[
+                ("↑↓/jk", "Select"),
+                ("Enter", "Preview"),
+                ("s", "Source"),
+                ("r", "Refresh"),
+                ("c", "Config"),
+                ("?", "Help"),
+                ("q", "Quit"),
+            ],
+            Screen::Preview => &[
+                ("↑↓/jk", "Scroll"),
+                ("f", "Folders/files"),
+                ("Enter", "Confirm"),
+                ("r", "Rescan"),
+                ("c", "Config"),
+                ("Esc", if app.show_files { "Folders" } else { "Sources" }),
+            ],
+            Screen::Scanning | Screen::Importing => {
+                &[("Esc/Ctrl+C", "Cancel safely"), ("?", "Help")]
+            }
+            Screen::Done if app.completed_archive().is_some() => &[
+                ("Enter", "New import"),
+                ("o", "Open archive"),
+                ("↑↓", "Scroll"),
+                ("c", "Config"),
+                ("?", "Help"),
+                ("q", "Quit"),
+            ],
+            Screen::Done => &[
+                ("Enter", "New import"),
+                ("↑↓", "Scroll"),
+                ("c", "Config"),
+                ("?", "Help"),
+                ("q", "Quit"),
+            ],
+        }
+    };
+    let mut lines = Vec::new();
+    let mut line = Line::default();
+    for &(key, action) in shortcuts {
+        let group = Line::from(vec![
+            Span::styled(format!("[{key}]"), accent().bg(SELECTED)),
+            Span::styled(format!(" {action}"), Style::default().fg(TEXT)),
+        ]);
+        if !line.spans.is_empty() && line.width() + 5 + group.width() > usize::from(width) {
+            lines.push(line);
+            line = Line::default();
+        }
+        if !line.spans.is_empty() {
+            line.spans.push(Span::styled("  │  ", muted()));
+        }
+        line.spans.extend(group.spans);
+    }
+    lines.push(line);
+    lines
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(
@@ -47,13 +135,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .style(Style::default().fg(CYAN)).wrap(Wrap { trim: false }), area);
         return;
     }
+    let hints = shortcut_lines(app, area.width.saturating_sub(2));
     let regions = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(if area.height < 32 { 5 } else { 7 }),
         Constraint::Length(1),
         Constraint::Min(6),
         Constraint::Length(2),
-        Constraint::Length(1),
+        Constraint::Length(hints.len() as u16),
     ])
     .margin(1)
     .split(area);
@@ -85,18 +174,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .wrap(Wrap { trim: false }),
         regions[4],
     );
-    let hints = match app.screen {
-        Screen::Settings => " Tab/↑↓ field   ←→ option   Ctrl+S save   Esc cancel",
-        Screen::Sources => {
-            " ↑↓/jk select   Enter preview   s source   r refresh   c config   ? help   q quit"
-        }
-        Screen::Preview => {
-            " ↑↓/jk scroll   f folders/files   Enter confirm   r rescan   c config   Esc back"
-        }
-        Screen::Scanning | Screen::Importing => " Esc / Ctrl+C cancel safely   ? help",
-        Screen::Done => " Enter new import   ↑↓ scroll   c config   ? help   q quit",
-    };
-    frame.render_widget(Paragraph::new(hints).style(muted()), regions[5]);
+    frame.render_widget(Paragraph::new(hints), regions[5]);
     if app.help {
         help(frame);
     }
@@ -105,6 +183,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.confirming {
         confirmation(frame, app);
+    }
+    if app.directory_browser.is_some() {
+        directory_dialog(frame, app);
     }
 }
 
@@ -206,10 +287,11 @@ fn settings(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(5),
         Constraint::Min(1),
     ])
-    .margin(1)
+    .horizontal_margin(1)
+    .vertical_margin(u16::from(inner.height >= 8))
     .split(inner);
     frame.render_widget(
-        Paragraph::new("Choose where your photos live and how dates become folders.")
+        Paragraph::new("Archive: Tab completes folders · Enter opens the folder browser.")
             .style(muted()),
         chunks[0],
     );
@@ -382,7 +464,7 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     if has_warning {
         let text = format!(
-            "{} photos use file modification dates (capture EXIF unavailable). {} unsupported files / symlinks ignored. Press f to inspect each photo.",
+            "{} photos use file modification dates (capture EXIF unavailable). {} unsupported files / symlinks / system folders ignored. Press f to inspect each photo.",
             plan.fallback_count(),
             plan.skipped_entries
         );
@@ -590,7 +672,13 @@ fn done(frame: &mut Frame, app: &App, area: Rect) {
             summary.copied, summary.skipped, summary.failed
         )),
         Line::from(""),
-        Line::from(format!("  Archive: {}", app.config.archive.display())),
+        Line::from(format!(
+            "  Archive: {}",
+            app.import_archive
+                .as_deref()
+                .unwrap_or(&app.config.archive)
+                .display()
+        )),
         Line::from(Span::styled(
             "  Your original files remain on the card.",
             muted(),
@@ -598,6 +686,9 @@ fn done(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from("  Press Enter to start another import."),
     ];
+    if app.completed_archive().is_some() {
+        lines.push(Line::from("  Press o to open the archive folder."));
+    }
     if summary.failed > 0 {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -678,7 +769,7 @@ fn confirmation(frame: &mut Frame, app: &App) {
 }
 
 fn source_dialog(frame: &mut Frame, input: &str, app: &App) {
-    let area = popup(frame, 76, 10);
+    let area = popup(frame, 76, 11);
     let lines = vec![
         Line::from(""),
         Line::from("  Enter the card's mount point or a photo directory:"),
@@ -686,9 +777,10 @@ fn source_dialog(frame: &mut Frame, input: &str, app: &App) {
         Line::from(Span::styled(format!("  {input}▏"), accent())),
         Line::from(""),
         Line::from(Span::styled(
-            "  Enter select · Esc cancel · Ctrl+U clear · ~/ supported",
+            "  Tab complete · Ctrl+B browse · Enter select · Esc cancel",
             muted(),
         )),
+        Line::from(Span::styled("  Ctrl+U clear · ~/ supported", muted())),
         Line::from(Span::styled(app.message.as_str(), Style::default().fg(RED))),
     ];
     frame.render_widget(
@@ -696,6 +788,198 @@ fn source_dialog(frame: &mut Frame, input: &str, app: &App) {
             .block(border("Choose source directory"))
             .wrap(Wrap { trim: false }),
         area,
+    );
+}
+
+fn directory_dialog(frame: &mut Frame, app: &mut App) {
+    let title = if app.source_input.is_some() {
+        "Browse source folders"
+    } else {
+        "Browse archive folders"
+    };
+    let screen = frame.area();
+    let footer_height = shortcut_lines(app, screen.width.saturating_sub(2)).len() as u16;
+    let available_height = screen.height.saturating_sub(footer_height + 1);
+    let width = 90.min(screen.width.saturating_sub(4));
+    let height = 26.min(available_height.saturating_sub(2));
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (available_height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = border(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Min(3),
+        Constraint::Length(2),
+        Constraint::Length(3),
+    ])
+    .margin(1)
+    .split(inner);
+    let browser = app.directory_browser.as_mut().unwrap();
+    let path = browser.current.display().to_string();
+    let available = chunks[0].width.saturating_sub(6) as usize;
+    let chars: Vec<_> = path.chars().collect();
+    let path = if chars.len() > available {
+        format!(
+            "…{}",
+            chars[chars.len().saturating_sub(available.saturating_sub(1))..]
+                .iter()
+                .collect::<String>()
+        )
+    } else {
+        path
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!("Use: {path}"), accent()))),
+        chunks[0],
+    );
+
+    let mut ancestors: Vec<_> = browser.current.ancestors().take(3).collect();
+    ancestors.reverse();
+    let tree: Vec<_> = ancestors
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            Line::from(Span::styled(
+                format!(
+                    "{}{}{}",
+                    "  ".repeat(index),
+                    if index == 0 { "" } else { "└─ " },
+                    name
+                ),
+                if *path == browser.current {
+                    accent()
+                } else {
+                    muted()
+                },
+            ))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(tree), chunks[1]);
+    if browser.entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("  No subfolders. Space uses this folder.").style(muted()),
+            chunks[2],
+        );
+    } else {
+        let rows = browser.entries.iter().enumerate().map(|(index, path)| {
+            Row::new(vec![format!(
+                "    {} {}/",
+                if index + 1 == browser.entries.len() {
+                    "└─"
+                } else {
+                    "├─"
+                },
+                path.file_name().unwrap().to_string_lossy()
+            )])
+        });
+        let table = Table::new(rows, [Constraint::Min(1)])
+            .row_highlight_style(
+                Style::default()
+                    .bg(SELECTED)
+                    .fg(CYAN)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(table, chunks[2], &mut browser.state);
+    }
+    let status = if !browser.error.is_empty() {
+        browser.error.clone()
+    } else if !browser.filter.is_empty() {
+        format!(
+            "Matching: {} · Tab uses the selected folder",
+            browser.filter
+        )
+    } else {
+        format!(
+            "{} folders · hidden folders {}",
+            browser.entries.len(),
+            if browser.show_hidden {
+                "shown"
+            } else {
+                "hidden"
+            }
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(status)
+            .style(if browser.error.is_empty() {
+                muted()
+            } else {
+                Style::default().fg(RED)
+            })
+            .wrap(Wrap { trim: false }),
+        chunks[3],
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("↑↓ select · Enter/→ open · ←/Backspace parent"),
+            Line::from("Space use current · Tab use selected · Esc cancel"),
+            Line::from("h home · / root · . hidden folders · PgUp/PgDn scroll"),
+        ])
+        .style(muted()),
+        chunks[4],
+    );
+    if browser.new_folder_input.is_some() {
+        new_folder_dialog(frame, browser);
+    }
+}
+
+fn new_folder_dialog(frame: &mut Frame, browser: &DirectoryBrowser) {
+    let area = popup(frame, 76, 13);
+    let block = border("Create new folder");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(2),
+        Constraint::Length(1),
+    ])
+    .margin(1)
+    .split(inner);
+    frame.render_widget(Paragraph::new("Create inside:").style(muted()), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(browser.current.display().to_string()).wrap(Wrap { trim: false }),
+        chunks[1],
+    );
+    frame.render_widget(Paragraph::new("Folder name:").style(muted()), chunks[2]);
+    let chars: Vec<_> = browser.new_folder_input.as_ref().unwrap().chars().collect();
+    let available = chunks[3].width.saturating_sub(1) as usize;
+    let input: String = chars[chars.len().saturating_sub(available)..]
+        .iter()
+        .collect();
+    frame.render_widget(
+        Paragraph::new(format!("{input}▏")).style(accent().bg(SELECTED)),
+        chunks[3],
+    );
+    frame.render_widget(
+        Paragraph::new(browser.error.as_str())
+            .style(Style::default().fg(RED))
+            .wrap(Wrap { trim: false }),
+        chunks[4],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("[Enter]", accent().bg(SELECTED)),
+            Span::raw(" Create & open"),
+            Span::styled("  │  ", muted()),
+            Span::styled("[Esc]", accent().bg(SELECTED)),
+            Span::raw(" Cancel"),
+        ])),
+        chunks[5],
     );
 }
 
@@ -707,8 +991,8 @@ fn help(frame: &mut Frame) {
             "  A quick path from card to archive",
             accent(),
         )),
-        Line::from("  1. Set your archive, folder layout, grouping, and date basis."),
-        Line::from("  2. Select a detected card, or press s to enter a source."),
+        Line::from("  1. Set your archive; Tab completes paths, Enter browses folders."),
+        Line::from("  2. Select a card, or s for a source (Tab completes, Ctrl+B browses)."),
         Line::from("  3. Press Enter to scan and review destination folders."),
         Line::from("  4. Press Enter again, then confirm the import."),
         Line::from(""),

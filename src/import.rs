@@ -188,9 +188,31 @@ pub fn build_plan(
     let today = Local::now().date_naive();
     let mut files = Vec::new();
     let mut skipped_entries = 0;
-    for entry in WalkDir::new(&source).follow_links(false) {
+    let mut walker = WalkDir::new(&source).follow_links(false).into_iter();
+    while let Some(entry) = walker.next() {
         cancelled(cancel)?;
         let entry = entry.with_context(|| format!("Cannot fully read {}", source.display()))?;
+        // Prune volume housekeeping before WalkDir tries to read protected contents.
+        // Keep scanning ordinary hidden folders, and honor an explicitly selected root.
+        if entry.depth() > 0
+            && entry.file_type().is_dir()
+            && matches!(
+                entry.file_name().to_str(),
+                Some(
+                    ".Trashes"
+                        | ".Spotlight-V100"
+                        | ".fseventsd"
+                        | ".TemporaryItems"
+                        | ".DocumentRevisions-V100"
+                        | "$RECYCLE.BIN"
+                        | "System Volume Information"
+                )
+            )
+        {
+            skipped_entries += 1;
+            walker.skip_current_dir();
+            continue;
+        }
         if entry.file_type().is_symlink() {
             skipped_entries += 1;
             continue;

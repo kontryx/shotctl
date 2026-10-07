@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod directories;
 mod import;
 mod media;
 mod ui;

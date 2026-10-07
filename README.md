@@ -54,11 +54,15 @@ Use an interactive terminal, preferably 100 columns × 32 rows or larger. Smalle
 
 ## Your first import
 
-1. Choose an archive directory. An absolute path or `~/` works; saving creates the directory if needed.
+1. Choose an archive directory. Type part of a path and press `Tab` to complete folder names, or press `Enter` / `Ctrl+B` to browse folders visually. An absolute path or `~/` works; saving creates the directory if needed.
 2. Pick a folder structure, photo grouping, and date basis. The header and examples update as you edit. Press `Ctrl+S` to save.
 3. Select your card. Mounted volumes with a `DCIM` folder are detected on macOS and Linux; press `r` after connecting one. Press `s` to choose any photo directory manually.
 4. Press `Enter` to scan. Review exact destination folders, file counts, duplicate skips, renamed conflicts, and metadata fallbacks. Press `f` to inspect individual destination files and their source paths.
 5. Press `Enter`, then `Enter` or `y` in the confirmation dialog to import. Follow progress and review the completion summary.
+
+After a successful import, press `o` to open the archive folder in your system's file manager and browse the newly created import folders.
+
+In the preview, `Esc` returns from the file view to the folder view. Press `Esc` again from the folder view to return to source selection. If the confirmation dialog is open, `Esc` closes it first.
 
 Press `c` to change configuration before another import. Saving or changing the source discards the previous preview so you can review the new destinations.
 
@@ -96,17 +100,25 @@ The month preset intentionally shares month folders across years; the full date 
 | `r` | Refresh detected cards; rescan from a preview |
 | `c` | Edit configuration |
 | `f` / `Tab` | Switch between folder and file previews |
+| `o` | Open the archive folder after a successful import |
 | `PageUp` / `PageDown` | Scroll a preview by ten rows |
 | `?` | Open help |
 | `Esc` | Go back; close a dialog; cancel an active operation |
 | `q` | Quit; cancel when an operation is running |
 | `Ctrl+C` | Quit; safely cancel an active operation |
 
-In configuration, use `Tab` / `Shift+Tab` or arrows to select a field, `←` / `→` / `Enter` to cycle options, and `Ctrl+S` to save. Text fields append characters; `Backspace` deletes and `Ctrl+U` clears. On first launch, `Esc` exits without saving.
+In configuration, use `↑` / `↓` or `Shift+Tab` to select a field, `←` / `→` / `Enter` to cycle options, and `Ctrl+S` to save. `Tab` moves forward from option fields; in the archive path it completes directory names. Text fields append characters; `Backspace` deletes and `Ctrl+U` clears. On first launch, `Esc` exits without saving.
+
+Both the archive path and manual source path support `Tab` completion and `Ctrl+B` to open a folder browser. Completion adds a trailing slash for a unique match and extends a shared prefix when possible. If several matches remain, choose one with `↑` / `↓` and `Tab`, or explore it with `Enter`. Files are excluded; hidden folders are included when you type a dot prefix.
+
+The browser shows the current folder's ancestry and its subfolders. Use `Enter` / `→` to open a subfolder, `←` / `Backspace` to go to its parent, `Space` to use the current folder, or `Tab` to use the highlighted subfolder. `h` jumps home, `/` jumps to the filesystem root, `.` toggles hidden folders, and `PageUp` / `PageDown` scroll. `Esc` returns to the original path without changing it. A path that does not exist yet opens at its nearest existing parent. Choosing a folder fills the path; `Ctrl+S` saves archive settings, and `Enter` accepts a manual source path.
+
+Press `n` in the browser to create a new folder inside the current directory. Enter its name, then press `Enter` to create and open it. `Space` chooses it as the destination, and `Ctrl+S` saves your archive settings. `Esc` cancels the name prompt before creation. Existing files and folders are preserved; duplicate names and permission errors are shown in the prompt.
 
 ## Import behavior
 
 - Recursively scans regular photo files. Supports JPEG, common RAW extensions (including ARW, CR2, CR3, DNG, NEF, ORF, RAF, RW2), HEIF, TIFF, and PNG. Other files, videos, sidecars, and symlinks are ignored and counted in the preview.
+- Skips known system folders such as macOS `.Trashes`, `.Spotlight-V100`, and `.fseventsd`, and Windows `$RECYCLE.BIN` and `System Volume Information`, before reading their contents. Each skipped folder counts as one ignored entry. Ordinary hidden photo folders are scanned; unreadable photo folders still report an error.
 - Copies photos and preserves their modification times. Originals are kept on the source.
 - Compares BLAKE3 hashes at each proposed destination. Identical files at that destination are skipped, including duplicates within the same import. This is destination-based deduplication; changing the date basis or folder settings can create another copy elsewhere.
 - Keeps conflicting contents by adding a stable 12-character content hash to the incoming filename, with a counter if necessary. Exact renamed destinations are shown in the preview.
@@ -143,4 +155,4 @@ cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-Tests use temporary cards and archives, including a TIFF/EXIF fixture, to cover folder presets, metadata fallback, duplicate handling, conflicts, changed files, cancellation, symlinks, configuration persistence, confirmation, and terminal rendering.
+Tests use temporary cards and archives, including a TIFF/EXIF fixture, to cover folder presets, metadata fallback, duplicate handling, conflicts, changed files, cancellation, symlinks, directory completion and browsing, configuration persistence, confirmation, and terminal rendering.
