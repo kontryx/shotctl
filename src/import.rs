@@ -30,6 +30,8 @@ pub enum Action {
 pub struct Photo {
     pub source: PathBuf,
     pub destination: PathBuf,
+    /// Natural destination folder relative to the archive, before custom-folder overrides.
+    pub layout_relative: PathBuf,
     pub bytes: u64,
     pub hash: blake3::Hash,
     pub action: Action,
@@ -42,6 +44,15 @@ pub struct Plan {
     pub archive: PathBuf,
     pub photos: Vec<Photo>,
     pub skipped_entries: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct FolderSummary {
+    pub path: PathBuf,
+    pub copy: usize,
+    pub skip: usize,
+    pub bytes: u64,
+    pub exists: bool,
 }
 
 impl Plan {
@@ -70,7 +81,7 @@ impl Plan {
             .map(|p| p.bytes)
             .sum()
     }
-    pub fn folders(&self) -> Vec<(PathBuf, usize, usize, u64)> {
+    pub fn folders(&self) -> Vec<FolderSummary> {
         let mut folders = BTreeMap::new();
         for photo in &self.photos {
             let relative = photo
@@ -89,8 +100,79 @@ impl Plan {
         }
         folders
             .into_iter()
-            .map(|(p, (copy, skip, bytes))| (p, copy, skip, bytes))
+            .map(|(path, (copy, skip, bytes))| {
+                let exists = self.archive.join(&path).exists();
+                FolderSummary {
+                    path,
+                    copy,
+                    skip,
+                    bytes,
+                    exists,
+                }
+            })
             .collect()
+    }
+}
+
+/// Single path component for a one-time parent under the archive.
+pub fn validate_one_time_folder(name: &str) -> Result<&str> {
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "Enter a folder name.");
+    let mut components = Path::new(name).components();
+    anyhow::ensure!(
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none()
+            && !name.contains(['/', '\\'])
+            && !name.chars().any(char::is_control),
+        "Enter a single folder name, without path separators."
+    );
+    Ok(name)
+}
+
+/// How a custom segment is applied under the normal layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SegmentInsert {
+    /// Insert before the leaf for the listed layout-relative new folders.
+    Selected { folders: Vec<PathBuf>, name: String },
+    /// Insert before the leaf of every destination folder that does not exist yet.
+    AllNew { name: String },
+}
+
+impl SegmentInsert {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Selected { name, .. } | Self::AllNew { name } => name,
+        }
+    }
+}
+
+/// `year/month/leaf` → `year/month/<name>/leaf`
+pub fn insert_segment_before_leaf(relative: &Path, name: &str) -> PathBuf {
+    match relative.file_name() {
+        Some(leaf) => relative
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(name)
+            .join(leaf),
+        None => relative.to_owned(),
+    }
+}
+
+fn apply_segment_insert(
+    relative: &Path,
+    archive: &Path,
+    insert: Option<&SegmentInsert>,
+) -> PathBuf {
+    match insert {
+        Some(SegmentInsert::Selected { folders, name })
+            if folders.iter().any(|folder| folder.as_path() == relative) =>
+        {
+            insert_segment_before_leaf(relative, name)
+        }
+        Some(SegmentInsert::AllNew { name }) if !archive.join(relative).exists() => {
+            insert_segment_before_leaf(relative, name)
+        }
+        _ => relative.to_owned(),
     }
 }
 
@@ -179,9 +261,13 @@ pub fn validate_roots(source: &Path, archive: &Path) -> Result<(PathBuf, PathBuf
 pub fn build_plan(
     source: &Path,
     config: &Config,
+    segment_insert: Option<&SegmentInsert>,
     tx: &Sender<WorkerEvent>,
     cancel: &AtomicBool,
 ) -> Result<Plan> {
+    if let Some(insert) = segment_insert {
+        validate_one_time_folder(insert.name())?;
+    }
     let (source, archive) = validate_roots(source, &config.archive)?;
     let mut config = config.clone();
     config.archive = archive.clone();
@@ -244,56 +330,31 @@ pub fn build_plan(
                 None => (media::modified_date(&path)?, true),
             },
         };
-        let directory = config.directory(date, media::photo_kind(&path).unwrap());
-        if !resolved_path(&directory)?.starts_with(&archive) {
-            bail!(
-                "Destination folder resolves outside the archive: {}",
-                directory.display()
-            );
-        }
-        let original = directory.join(path.file_name().unwrap());
-        let mut destination = original.clone();
-        let mut action = Action::Copy;
-        let mut suffix = 0usize;
-        loop {
-            let matches = if let Some(existing) = reserved.get(&destination) {
-                Some(*existing == hash)
-            } else if fs::symlink_metadata(&destination).is_ok() {
-                // A symlink or directory is a conflict, even if its target matches.
-                let metadata = fs::symlink_metadata(&destination)?;
-                Some(
-                    metadata.is_file()
-                        && metadata.len() == bytes
-                        && hash_file(&destination, cancel)? == hash,
+        let base = config.directory(date, media::photo_kind(&path).unwrap());
+        let layout_relative = base
+            .strip_prefix(&config.archive)
+            .with_context(|| {
+                format!(
+                    "Destination folder is outside the archive: {}",
+                    base.display()
                 )
-            } else {
-                None
-            };
-            match matches {
-                None => break,
-                Some(true) => {
-                    action = Action::Skip;
-                    break;
-                }
-                Some(false) => {
-                    suffix += 1;
-                    let stem = original.file_stem().unwrap().to_string_lossy();
-                    let ext = original.extension().unwrap().to_string_lossy();
-                    let digest = hash.to_hex();
-                    let extra = if suffix == 1 {
-                        String::new()
-                    } else {
-                        format!("-{suffix}")
-                    };
-                    destination = directory.join(format!("{stem}-{}{extra}.{ext}", &digest[..12]));
-                    action = Action::Rename;
-                }
-            }
-        }
-        reserved.insert(destination.clone(), hash);
+            })?
+            .to_owned();
+        let directory =
+            destination_directory(&config.archive, &layout_relative, segment_insert)?;
+        let file_name = path.file_name().unwrap();
+        let (destination, action) = resolve_destination(
+            &directory,
+            file_name,
+            bytes,
+            hash,
+            &mut reserved,
+            cancel,
+        )?;
         photos.push(Photo {
             source: path,
             destination,
+            layout_relative,
             bytes,
             hash,
             action,
@@ -306,6 +367,117 @@ pub fn build_plan(
         photos,
         skipped_entries,
     })
+}
+
+fn destination_directory(
+    archive: &Path,
+    layout_relative: &Path,
+    segment_insert: Option<&SegmentInsert>,
+) -> Result<PathBuf> {
+    let relative = apply_segment_insert(layout_relative, archive, segment_insert);
+    let directory = archive.join(relative);
+    if !resolved_path(&directory)?.starts_with(archive) {
+        bail!(
+            "Destination folder resolves outside the archive: {}",
+            directory.display()
+        );
+    }
+    Ok(directory)
+}
+
+fn resolve_destination(
+    directory: &Path,
+    file_name: &std::ffi::OsStr,
+    bytes: u64,
+    hash: blake3::Hash,
+    reserved: &mut HashMap<PathBuf, blake3::Hash>,
+    cancel: &AtomicBool,
+) -> Result<(PathBuf, Action)> {
+    let original = directory.join(file_name);
+    let mut destination = original.clone();
+    let mut action = Action::Copy;
+    let mut suffix = 0usize;
+    loop {
+        let matches = if let Some(existing) = reserved.get(&destination) {
+            Some(*existing == hash)
+        } else if fs::symlink_metadata(&destination).is_ok() {
+            // A symlink or directory is a conflict, even if its target matches.
+            let metadata = fs::symlink_metadata(&destination)?;
+            Some(
+                metadata.is_file()
+                    && metadata.len() == bytes
+                    && hash_file(&destination, cancel)? == hash,
+            )
+        } else {
+            None
+        };
+        match matches {
+            None => break,
+            Some(true) => {
+                action = Action::Skip;
+                break;
+            }
+            Some(false) => {
+                suffix += 1;
+                let stem = original.file_stem().unwrap().to_string_lossy();
+                let ext = original.extension().unwrap().to_string_lossy();
+                let digest = hash.to_hex();
+                let extra = if suffix == 1 {
+                    String::new()
+                } else {
+                    format!("-{suffix}")
+                };
+                destination = directory.join(format!("{stem}-{}{extra}.{ext}", &digest[..12]));
+                action = Action::Rename;
+            }
+        }
+    }
+    reserved.insert(destination.clone(), hash);
+    Ok((destination, action))
+}
+
+/// Recompute destinations from an existing plan after custom-folder overrides change.
+///
+/// Reuses the initial scan (source paths, hashes, layout folders). Photos whose
+/// destination folder is unchanged keep their action as-is. Only photos that move
+/// into a new folder are re-checked against the archive.
+pub fn remap_plan_destinations(
+    plan: &mut Plan,
+    segment_insert: Option<&SegmentInsert>,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    if let Some(insert) = segment_insert {
+        validate_one_time_folder(insert.name())?;
+    }
+    let mut reserved = HashMap::new();
+    // Keep stable destinations first so remapped photos see them as reserved.
+    for photo in &plan.photos {
+        let directory =
+            destination_directory(&plan.archive, &photo.layout_relative, segment_insert)?;
+        if photo.destination.parent() == Some(directory.as_path()) {
+            reserved.insert(photo.destination.clone(), photo.hash);
+        }
+    }
+    for photo in &mut plan.photos {
+        cancelled(cancel)?;
+        let directory =
+            destination_directory(&plan.archive, &photo.layout_relative, segment_insert)?;
+        if photo.destination.parent() == Some(directory.as_path()) {
+            continue;
+        }
+        let file_name = photo.source.file_name().context("Photo has no file name")?;
+        let (destination, action) = resolve_destination(
+            &directory,
+            file_name,
+            photo.bytes,
+            photo.hash,
+            &mut reserved,
+            cancel,
+        )?;
+        photo.destination = destination;
+        photo.action = action;
+    }
+    Ok(())
 }
 
 fn copy_photo(
@@ -492,6 +664,7 @@ mod tests {
         let photo = Photo {
             source: source.clone(),
             destination: archive.join("photo.JPG"),
+            layout_relative: PathBuf::new(),
             bytes: contents.len() as u64,
             hash: blake3::hash(&contents),
             action: Action::Copy,

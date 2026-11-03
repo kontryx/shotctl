@@ -26,8 +26,16 @@ fn fixture() -> (TempDir, Config) {
 }
 
 fn plan(source: &Path, config: &Config) -> Plan {
+    plan_with_segment(source, config, None)
+}
+
+fn plan_with_segment(
+    source: &Path,
+    config: &Config,
+    segment_insert: Option<&import::SegmentInsert>,
+) -> Plan {
     let (tx, _rx) = mpsc::channel::<WorkerEvent>();
-    import::build_plan(source, config, &tx, &AtomicBool::new(false)).unwrap()
+    import::build_plan(source, config, segment_insert, &tx, &AtomicBool::new(false)).unwrap()
 }
 
 fn execute(plan: Plan) -> import::Summary {
@@ -73,6 +81,7 @@ fn first_import_verifies_bytes_and_second_import_skips_duplicates() {
     let first = plan(&card, &config);
     assert_eq!(first.copy_count(), 2);
     assert_eq!(first.folders().len(), 2);
+    assert!(first.folders().iter().all(|folder| !folder.exists));
     assert_eq!(first.skipped_entries, 1);
     let destination = first
         .photos
@@ -87,8 +96,120 @@ fn first_import_verifies_bytes_and_second_import_skips_duplicates() {
     let second = plan(&card, &config);
     assert_eq!(second.copy_count(), 0);
     assert_eq!(second.skip_count(), 2);
+    assert!(second.folders().iter().all(|folder| folder.exists));
     let summary = execute(second);
     assert_eq!((summary.copied, summary.skipped, summary.failed), (0, 2, 0));
+}
+
+#[test]
+fn custom_folder_name_rejects_path_separators() {
+    assert!(
+        import::validate_one_time_folder("bad/name").is_err(),
+        "path separators must be rejected"
+    );
+}
+
+#[test]
+fn remapping_custom_folder_leaves_unaffected_photos_unchanged() {
+    let (temp, config) = fixture();
+    let card = temp.path().join("card");
+    fs::write(card.join("DCIM/100CAM/keep.JPG"), b"jpeg").unwrap();
+    fs::write(card.join("DCIM/100CAM/move.ARW"), b"raw").unwrap();
+    let mut preview = plan(&card, &config);
+    let jpeg = preview
+        .photos
+        .iter()
+        .find(|p| p.source.extension().unwrap() == "JPG")
+        .unwrap();
+    let jpeg_destination = jpeg.destination.clone();
+    let jpeg_action = jpeg.action;
+    let raw_layout = preview
+        .photos
+        .iter()
+        .find(|p| p.source.extension().unwrap() == "ARW")
+        .unwrap()
+        .layout_relative
+        .clone();
+    let insert = import::SegmentInsert::Selected {
+        folders: vec![raw_layout],
+        name: "Trip".into(),
+    };
+    import::remap_plan_destinations(&mut preview, Some(&insert), &AtomicBool::new(false)).unwrap();
+    let jpeg = preview
+        .photos
+        .iter()
+        .find(|p| p.source.extension().unwrap() == "JPG")
+        .unwrap();
+    assert_eq!(jpeg.destination, jpeg_destination);
+    assert_eq!(jpeg.action, jpeg_action);
+    let raw = preview
+        .photos
+        .iter()
+        .find(|p| p.source.extension().unwrap() == "ARW")
+        .unwrap();
+    assert!(raw
+        .destination
+        .parent()
+        .unwrap()
+        .ends_with(Path::new("Trip").join(raw.layout_relative.file_name().unwrap())));
+}
+
+#[test]
+fn selected_folder_inserts_segment_before_leaf() {
+    let (temp, config) = fixture();
+    let card = temp.path().join("card");
+    fs::write(card.join("DCIM/100CAM/DSC_0001.ARW"), b"raw photo content").unwrap();
+    let baseline = plan(&card, &config);
+    let from = baseline.photos[0]
+        .destination
+        .parent()
+        .unwrap()
+        .strip_prefix(&baseline.archive)
+        .unwrap()
+        .to_owned();
+    let insert = import::SegmentInsert::Selected {
+        folders: vec![from.clone()],
+        name: "CustomShoot".into(),
+    };
+    let updated = plan_with_segment(&card, &config, Some(&insert));
+    let relative = updated.photos[0]
+        .destination
+        .parent()
+        .unwrap()
+        .strip_prefix(&updated.archive)
+        .unwrap();
+    assert_eq!(
+        relative,
+        import::insert_segment_before_leaf(&from, "CustomShoot")
+    );
+}
+
+#[test]
+fn all_new_folders_insert_skips_existing_destinations() {
+    let (temp, config) = fixture();
+    let card = temp.path().join("card");
+    fs::write(card.join("DCIM/100CAM/old.JPG"), b"already archived").unwrap();
+    execute(plan(&card, &config));
+    fs::write(card.join("DCIM/100CAM/new.ARW"), b"brand new raw").unwrap();
+    let insert = import::SegmentInsert::AllNew {
+        name: "Trip".into(),
+    };
+    let preview = plan_with_segment(&card, &config, Some(&insert));
+    let paths: Vec<_> = preview
+        .folders()
+        .into_iter()
+        .map(|folder| folder.path.display().to_string())
+        .collect();
+    assert!(
+        paths.iter().any(|path| path.contains("Trip/") && path.contains("RAW")),
+        "new RAW folder should include the custom segment: {paths:?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|path| !path.contains("Trip/") && path.contains("JPEG")),
+        "existing JPEG folder should keep its natural path: {paths:?}"
+    );
 }
 
 #[test]
@@ -142,7 +263,7 @@ fn protected_trash_does_not_block_scans_but_unreadable_photo_folders_do() {
     let original_permissions = fs::metadata(&trash).unwrap().permissions();
     fs::set_permissions(&trash, fs::Permissions::from_mode(0o0)).unwrap();
     let (tx, _rx) = mpsc::channel();
-    let result = import::build_plan(&card, &config, &tx, &AtomicBool::new(false));
+    let result = import::build_plan(&card, &config, None, &tx, &AtomicBool::new(false));
     fs::set_permissions(&trash, original_permissions).unwrap();
     let preview = result.unwrap();
     assert_eq!(preview.copy_count(), 1);
@@ -154,7 +275,7 @@ fn protected_trash_does_not_block_scans_but_unreadable_photo_folders_do() {
     let original_permissions = fs::metadata(&shoot).unwrap().permissions();
     fs::set_permissions(&shoot, fs::Permissions::from_mode(0o0)).unwrap();
     let permission_denied = fs::read_dir(&shoot).is_err();
-    let result = import::build_plan(&card, &config, &tx, &AtomicBool::new(false));
+    let result = import::build_plan(&card, &config, None, &tx, &AtomicBool::new(false));
     fs::set_permissions(&shoot, original_permissions).unwrap();
     if permission_denied {
         assert!(format!("{:#}", result.unwrap_err()).contains("Unreadable Shoot"));
@@ -352,7 +473,9 @@ fn symlinks_cannot_route_imports_outside_the_archive() {
     let month = Local::now().format("%m").to_string();
     symlink(&outside, config.archive.join(month)).unwrap();
     let (tx, _rx) = mpsc::channel();
-    assert!(import::build_plan(&card, &config, &tx, &AtomicBool::new(false)).is_err());
+    assert!(
+        import::build_plan(&card, &config, None, &tx, &AtomicBool::new(false)).is_err()
+    );
     assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
     assert!(import::validate_roots(&card, &card.join("DCIM")).is_err());
 }

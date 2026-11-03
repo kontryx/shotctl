@@ -17,7 +17,7 @@ use ratatui::{DefaultTerminal, widgets::TableState};
 use crate::{
     config::{Config, DateBasis, expand_path},
     directories::{self, Completion, DirectoryBrowser},
-    import::{self, Plan, Summary, WorkerEvent},
+    import::{self, FolderSummary, Plan, SegmentInsert, Summary, WorkerEvent},
     media, ui,
 };
 
@@ -29,6 +29,25 @@ pub enum Screen {
     Preview,
     Importing,
     Done,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustomFolderScope {
+    SelectedFolder,
+    AllNewFolders,
+}
+
+impl CustomFolderScope {
+    fn next(self) -> Self {
+        match self {
+            Self::SelectedFolder => Self::AllNewFolders,
+            Self::AllNewFolders => Self::SelectedFolder,
+        }
+    }
+
+    fn prev(self) -> Self {
+        self.next()
+    }
 }
 
 pub struct App {
@@ -44,6 +63,15 @@ pub struct App {
     pub plan: Option<Plan>,
     pub preview_state: TableState,
     pub show_files: bool,
+    pub segment_insert: Option<SegmentInsert>,
+    pub custom_folder_input: Option<String>,
+    pub custom_folder_scope: CustomFolderScope,
+    /// Layout-relative new folders shown in the custom-folder picker.
+    pub custom_folder_choices: Vec<PathBuf>,
+    /// Which `custom_folder_choices` entries are checked.
+    pub custom_folder_checked: Vec<bool>,
+    /// Cursor index inside the custom-folder picker list.
+    pub custom_folder_cursor: usize,
     pub summary: Option<Summary>,
     pub import_archive: Option<PathBuf>,
     pub message: String,
@@ -100,6 +128,12 @@ impl App {
             plan: None,
             preview_state: TableState::default().with_selected(Some(0)),
             show_files: false,
+            segment_insert: None,
+            custom_folder_input: None,
+            custom_folder_scope: CustomFolderScope::AllNewFolders,
+            custom_folder_choices: Vec::new(),
+            custom_folder_checked: Vec::new(),
+            custom_folder_cursor: 0,
             summary: None,
             import_archive: None,
             message: String::new(),
@@ -152,13 +186,17 @@ impl App {
                 WorkerEvent::Planned(plan) => {
                     self.message = if plan.photos.is_empty() {
                         "No supported photos found. Press Esc to choose another source.".into()
+                    } else if self.segment_insert.is_some() {
+                        "Custom folder active. Press n to change or clear, Enter to confirm.".into()
                     } else {
-                        "Review the folders below. Press f for individual files, then Enter to confirm.".into()
+                        "Review folders. Press n for a custom folder, or Enter to confirm.".into()
                     };
                     self.plan = Some(plan);
                     self.screen = Screen::Preview;
-                    self.preview_state = TableState::default().with_selected(Some(0));
                     self.show_files = false;
+                    self.preview_state = TableState::default().with_selected(Some(
+                        self.first_selectable_preview_row().unwrap_or(0),
+                    ));
                     self.finish_worker();
                 }
                 WorkerEvent::Progress {
@@ -250,10 +288,17 @@ impl App {
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         let config = self.config.clone();
+        let segment_insert = self.segment_insert.clone();
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
         self.worker = Some(thread::spawn(move || {
-            let event = match import::build_plan(&source, &config, &tx, &cancel) {
+            let event = match import::build_plan(
+                &source,
+                &config,
+                segment_insert.as_ref(),
+                &tx,
+                &cancel,
+            ) {
                 Ok(plan) => WorkerEvent::Planned(plan),
                 Err(e) => WorkerEvent::Failed(format!("{e:#}")),
             };
@@ -288,7 +333,17 @@ impl App {
         self.field = 0;
         self.screen = Screen::Settings;
         self.plan = None;
+        self.clear_custom_folder();
         self.clear_message();
+    }
+
+    fn clear_custom_folder(&mut self) {
+        self.segment_insert = None;
+        self.custom_folder_input = None;
+        self.custom_folder_scope = CustomFolderScope::AllNewFolders;
+        self.custom_folder_choices.clear();
+        self.custom_folder_checked.clear();
+        self.custom_folder_cursor = 0;
     }
 
     pub fn completed_archive(&self) -> Option<&Path> {
@@ -383,6 +438,10 @@ impl App {
             }
             return;
         }
+        if self.custom_folder_input.is_some() {
+            self.custom_folder_key(key);
+            return;
+        }
         if self.screen == Screen::Settings {
             self.settings_key(key);
             return;
@@ -406,7 +465,9 @@ impl App {
             }
             KeyCode::Esc if self.screen == Screen::Preview && self.show_files => {
                 self.show_files = false;
-                self.preview_state = TableState::default().with_selected(Some(0));
+                self.preview_state = TableState::default().with_selected(
+                    Some(self.first_selectable_preview_row().unwrap_or(0)),
+                );
             }
             KeyCode::Esc => {
                 self.screen = Screen::Sources;
@@ -428,7 +489,19 @@ impl App {
                 Screen::Preview => match key.code {
                     KeyCode::Char('f') | KeyCode::Tab => {
                         self.show_files = !self.show_files;
-                        self.preview_state = TableState::default().with_selected(Some(0));
+                        self.preview_state = TableState::default().with_selected(Some(
+                            if self.show_files {
+                                0
+                            } else {
+                                self.first_selectable_preview_row().unwrap_or(0)
+                            },
+                        ));
+                    }
+                    KeyCode::Char('n') if !self.show_files => {
+                        self.open_custom_folder_dialog();
+                    }
+                    KeyCode::Char('x') if !self.show_files && self.segment_insert.is_some() => {
+                        self.clear_applied_custom_folder();
                     }
                     KeyCode::Enter | KeyCode::Char('i') => {
                         if self.plan.as_ref().is_some_and(|p| !p.photos.is_empty()) {
@@ -436,28 +509,17 @@ impl App {
                         }
                     }
                     KeyCode::Char('r') => self.scan(),
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        let len = self.preview_len();
-                        move_selection(&mut self.preview_state, len, 1);
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        let len = self.preview_len();
-                        move_selection(&mut self.preview_state, len, -1);
-                    }
-                    KeyCode::PageDown => {
-                        let len = self.preview_len();
-                        move_selection(&mut self.preview_state, len, 10);
-                    }
-                    KeyCode::PageUp => {
-                        let len = self.preview_len();
-                        move_selection(&mut self.preview_state, len, -10);
-                    }
+                    KeyCode::Down | KeyCode::Char('j') => self.move_preview(1),
+                    KeyCode::Up | KeyCode::Char('k') => self.move_preview(-1),
+                    KeyCode::PageDown => self.move_preview(10),
+                    KeyCode::PageUp => self.move_preview(-10),
                     _ => {}
                 },
                 Screen::Done => match key.code {
                     KeyCode::Char('o') => self.open_archive(),
                     KeyCode::Enter | KeyCode::Char('r') => {
                         self.screen = Screen::Sources;
+                        self.clear_custom_folder();
                         self.clear_message();
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -480,10 +542,306 @@ impl App {
                 if self.show_files {
                     p.photos.len()
                 } else {
-                    p.folders().len()
+                    ui::preview_folder_rows(p).len()
                 }
             })
             .unwrap_or(0)
+    }
+
+    fn first_selectable_preview_row(&self) -> Option<usize> {
+        let plan = self.plan.as_ref()?;
+        if self.show_files {
+            return (!plan.photos.is_empty()).then_some(0);
+        }
+        ui::preview_folder_rows(plan)
+            .iter()
+            .position(|row| row.is_folder())
+    }
+
+    fn move_preview(&mut self, delta: isize) {
+        let len = self.preview_len();
+        if len == 0 {
+            return;
+        }
+        if self.show_files {
+            move_selection(&mut self.preview_state, len, delta);
+            return;
+        }
+        let Some(plan) = &self.plan else { return };
+        let rows = ui::preview_folder_rows(plan);
+        let current = self.preview_state.selected().unwrap_or(0);
+        let mut index = current as isize;
+        let step = if delta == 0 {
+            0
+        } else if delta > 0 {
+            1
+        } else {
+            -1
+        };
+        let mut remaining = delta.unsigned_abs();
+        while remaining > 0 && step != 0 {
+            let next = index + step;
+            if next < 0 || next as usize >= rows.len() {
+                break;
+            }
+            index = next;
+            if rows[index as usize].is_folder() {
+                remaining -= 1;
+            }
+        }
+        if !rows[index as usize].is_folder() {
+            if let Some(fallback) = rows.iter().position(|row| row.is_folder()) {
+                index = fallback as isize;
+            }
+        }
+        self.preview_state.select(Some(index as usize));
+    }
+
+    fn open_custom_folder_dialog(&mut self) {
+        self.custom_folder_scope = match &self.segment_insert {
+            Some(SegmentInsert::Selected { .. }) => CustomFolderScope::SelectedFolder,
+            Some(SegmentInsert::AllNew { .. }) | None => CustomFolderScope::AllNewFolders,
+        };
+        self.custom_folder_input = Some(
+            self.segment_insert
+                .as_ref()
+                .map(|insert| insert.name().to_owned())
+                .unwrap_or_default(),
+        );
+        self.refresh_custom_folder_choices();
+        self.clear_message();
+    }
+
+    fn refresh_custom_folder_choices(&mut self) {
+        let choices = self.new_folder_layout_paths();
+        let previously_checked: std::collections::BTreeSet<PathBuf> =
+            match &self.segment_insert {
+                Some(SegmentInsert::Selected { folders, .. }) => folders.iter().cloned().collect(),
+                _ => self
+                    .selected_new_folder_layout_path()
+                    .into_iter()
+                    .collect(),
+            };
+        let mut checked: Vec<bool> = choices
+            .iter()
+            .map(|path| previously_checked.contains(path))
+            .collect();
+        if !checked.iter().any(|c| *c) {
+            if let Some(selected) = self.selected_new_folder_layout_path() {
+                if let Some(index) = choices.iter().position(|path| path == &selected) {
+                    checked[index] = true;
+                }
+            } else if let Some(first) = checked.first_mut() {
+                *first = true;
+            }
+        }
+        self.custom_folder_cursor = checked
+            .iter()
+            .position(|value| *value)
+            .unwrap_or(0)
+            .min(choices.len().saturating_sub(1));
+        self.custom_folder_choices = choices;
+        self.custom_folder_checked = checked;
+    }
+
+    pub fn new_folder_layout_paths(&self) -> Vec<PathBuf> {
+        let Some(plan) = &self.plan else {
+            return Vec::new();
+        };
+        let mut paths = Vec::new();
+        for folder in plan.folders() {
+            let natural = self.natural_layout_path(&folder.path);
+            let is_new = !plan.archive.join(&natural).exists();
+            if is_new && !paths.iter().any(|path| path == &natural) {
+                paths.push(natural);
+            }
+        }
+        paths
+    }
+
+    pub fn checked_custom_folders(&self) -> Vec<PathBuf> {
+        self.custom_folder_choices
+            .iter()
+            .zip(self.custom_folder_checked.iter())
+            .filter_map(|(path, checked)| checked.then(|| path.clone()))
+            .collect()
+    }
+
+    pub fn selected_preview_folder(&self) -> Option<FolderSummary> {
+        let plan = self.plan.as_ref()?;
+        if self.show_files {
+            return None;
+        }
+        let index = self.preview_state.selected()?;
+        match ui::preview_folder_rows(plan).get(index)? {
+            ui::PreviewFolderRow::Folder(folder) => Some(folder.clone()),
+            ui::PreviewFolderRow::Header { .. } => None,
+        }
+    }
+
+    /// Natural layout path for the selected new folder (strips parent / insert segment).
+    pub fn selected_new_folder_layout_path(&self) -> Option<PathBuf> {
+        let folder = self.selected_preview_folder()?;
+        if folder.exists {
+            return None;
+        }
+        Some(self.natural_layout_path(&folder.path))
+    }
+
+    fn natural_layout_path(&self, path: &Path) -> PathBuf {
+        let mut path = path.to_owned();
+        if let Some(name) = self.segment_insert.as_ref().map(SegmentInsert::name)
+            && let (Some(leaf), Some(parent)) = (path.file_name(), path.parent())
+            && parent.file_name().is_some_and(|n| n == name)
+        {
+            let grand = parent.parent().unwrap_or_else(|| Path::new(""));
+            path = grand.join(leaf);
+        }
+        path
+    }
+
+    fn custom_folder_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.custom_folder_input = None;
+                self.clear_message();
+            }
+            KeyCode::Char('x') => {
+                self.clear_applied_custom_folder();
+            }
+            KeyCode::Left => {
+                self.custom_folder_scope = self.custom_folder_scope.prev();
+                self.clear_message();
+            }
+            KeyCode::Right => {
+                self.custom_folder_scope = self.custom_folder_scope.next();
+                self.clear_message();
+            }
+            KeyCode::Up
+                if self.custom_folder_scope == CustomFolderScope::SelectedFolder
+                    && !self.custom_folder_choices.is_empty() =>
+            {
+                self.custom_folder_cursor = self.custom_folder_cursor.saturating_sub(1);
+                self.clear_message();
+            }
+            KeyCode::Down
+                if self.custom_folder_scope == CustomFolderScope::SelectedFolder
+                    && !self.custom_folder_choices.is_empty() =>
+            {
+                let max = self.custom_folder_choices.len().saturating_sub(1);
+                self.custom_folder_cursor = (self.custom_folder_cursor + 1).min(max);
+                self.clear_message();
+            }
+            KeyCode::Char(' ')
+                if self.custom_folder_scope == CustomFolderScope::SelectedFolder
+                    && !self.custom_folder_checked.is_empty() =>
+            {
+                let index = self.custom_folder_cursor;
+                if let Some(checked) = self.custom_folder_checked.get_mut(index) {
+                    *checked = !*checked;
+                }
+                self.clear_message();
+            }
+            KeyCode::Enter => {
+                let input = self.custom_folder_input.as_ref().unwrap().clone();
+                let trimmed = input.trim();
+                if trimmed.is_empty() {
+                    self.segment_insert = None;
+                    self.custom_folder_input = None;
+                    self.apply_custom_folder_remap();
+                    return;
+                }
+                match import::validate_one_time_folder(trimmed) {
+                    Ok(name) => match self.custom_folder_scope {
+                        CustomFolderScope::SelectedFolder => {
+                            let folders = self.checked_custom_folders();
+                            if folders.is_empty() {
+                                self.set_error(
+                                    "Check at least one new folder with Space, then Apply.".into(),
+                                );
+                                return;
+                            }
+                            self.segment_insert = Some(SegmentInsert::Selected {
+                                folders,
+                                name: name.to_owned(),
+                            });
+                            self.custom_folder_input = None;
+                            self.apply_custom_folder_remap();
+                        }
+                        CustomFolderScope::AllNewFolders => {
+                            self.segment_insert = Some(SegmentInsert::AllNew {
+                                name: name.to_owned(),
+                            });
+                            self.custom_folder_input = None;
+                            self.apply_custom_folder_remap();
+                        }
+                    },
+                    Err(error) => self.set_error(format!("{error:#}")),
+                }
+            }
+            KeyCode::Backspace => {
+                self.custom_folder_input.as_mut().unwrap().pop();
+                self.clear_message();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.custom_folder_input.as_mut().unwrap().clear();
+                self.clear_message();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.custom_folder_input.as_mut().unwrap().push(c);
+                self.clear_message();
+            }
+            _ => {}
+        }
+    }
+
+    fn clear_applied_custom_folder(&mut self) {
+        self.segment_insert = None;
+        self.custom_folder_input = None;
+        self.custom_folder_choices.clear();
+        self.custom_folder_checked.clear();
+        self.custom_folder_cursor = 0;
+        self.apply_custom_folder_remap();
+        if !self.error {
+            self.message =
+                "Custom folder removed. Press n to add one again, or Enter to confirm.".into();
+        }
+    }
+
+    /// Remap the current preview in place — no card rescan or source rehash.
+    fn apply_custom_folder_remap(&mut self) {
+        if self.plan.is_none() {
+            self.scan();
+            return;
+        }
+        let segment = self.segment_insert.clone();
+        let result = import::remap_plan_destinations(
+            self.plan.as_mut().unwrap(),
+            segment.as_ref(),
+            &AtomicBool::new(false),
+        );
+        match result {
+            Ok(()) => {
+                self.show_files = false;
+                let selected = self.first_selectable_preview_row().unwrap_or(0);
+                self.preview_state = TableState::default().with_selected(Some(selected));
+                self.message = if self.segment_insert.is_some() {
+                    "Custom folder active. Press n to change or clear, Enter to confirm.".into()
+                } else {
+                    "Review folders. Press n for a custom folder, or Enter to confirm.".into()
+                };
+                self.error = false;
+            }
+            Err(error) => {
+                self.set_error(format!("{error:#}"));
+                self.custom_folder_input = Some(
+                    self.segment_insert
+                        .as_ref()
+                        .map(|insert| insert.name().to_owned())
+                        .unwrap_or_default(),
+                );
+            }
+        }
     }
 
     fn cancel_operation(&mut self) {
@@ -846,7 +1204,10 @@ mod tests {
         assert!(app.screen == Screen::Preview && !app.show_files);
         assert_eq!(app.plan.as_ref().unwrap().copy_count(), 2);
         assert_eq!(app.message, preview_message);
-        assert_eq!(app.preview_state.selected(), Some(0));
+        assert_eq!(
+            app.preview_state.selected(),
+            Some(app.first_selectable_preview_row().unwrap())
+        );
         press(&mut app, KeyCode::Tab);
         assert!(app.show_files);
         press(&mut app, KeyCode::Esc);
@@ -921,6 +1282,113 @@ mod tests {
         assert!(app.plan.is_none() && app.screen == Screen::Settings);
         press(&mut app, KeyCode::Esc);
         assert!(app.screen == Screen::Sources && app.plan.is_none());
+    }
+
+    #[test]
+    fn custom_folder_all_new_can_be_set_cleared_and_is_reset_from_settings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let card = temp.path().join("card");
+        fs::create_dir(&card).unwrap();
+        fs::write(card.join("photo.JPG"), b"jpeg data").unwrap();
+        let archive = temp.path().join("archive");
+        let config_path = temp.path().join("config.toml");
+        Config {
+            archive: archive.clone(),
+            ..Config::default()
+        }
+        .save(&config_path)
+        .unwrap();
+        let mut app = App::new(config_path, Some(card)).unwrap();
+        press(&mut app, KeyCode::Enter);
+        wait_for(&mut app, Screen::Preview);
+        let layout = app.plan.as_ref().unwrap().photos[0]
+            .layout_relative
+            .clone();
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.custom_folder_input.is_some());
+        assert_eq!(app.custom_folder_scope, CustomFolderScope::AllNewFolders);
+        for ch in "MyTrip".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.segment_insert,
+            Some(SegmentInsert::AllNew {
+                name: "MyTrip".into()
+            })
+        );
+        let destination = app.plan.as_ref().unwrap().photos[0]
+            .destination
+            .parent()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            destination,
+            app.plan.as_ref().unwrap().archive.join(import::insert_segment_before_leaf(
+                &layout, "MyTrip"
+            ))
+        );
+        press(&mut app, KeyCode::Char('n'));
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.segment_insert.is_none());
+        press(&mut app, KeyCode::Char('n'));
+        for ch in "Keep".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.segment_insert.as_ref().map(SegmentInsert::name),
+            Some("Keep")
+        );
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.segment_insert.is_none() && app.custom_folder_input.is_none());
+    }
+
+    #[test]
+    fn custom_folder_can_insert_segment_for_selected_new_folder() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let card = temp.path().join("card");
+        fs::create_dir(&card).unwrap();
+        fs::write(card.join("photo.JPG"), b"jpeg data").unwrap();
+        let archive = temp.path().join("archive");
+        let config_path = temp.path().join("config.toml");
+        Config {
+            archive: archive.clone(),
+            ..Config::default()
+        }
+        .save(&config_path)
+        .unwrap();
+        let mut app = App::new(config_path, Some(card)).unwrap();
+        press(&mut app, KeyCode::Enter);
+        wait_for(&mut app, Screen::Preview);
+        let from = app.selected_new_folder_layout_path().unwrap();
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.custom_folder_scope, CustomFolderScope::SelectedFolder);
+        assert!(app.custom_folder_checked.iter().any(|checked| *checked));
+        for ch in "CustomShoot".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.segment_insert,
+            Some(SegmentInsert::Selected {
+                folders: vec![from.clone()],
+                name: "CustomShoot".into(),
+            })
+        );
+        let destination = app.plan.as_ref().unwrap().photos[0]
+            .destination
+            .parent()
+            .unwrap();
+        let expected = app
+            .plan
+            .as_ref()
+            .unwrap()
+            .archive
+            .join(import::insert_segment_before_leaf(&from, "CustomShoot"));
+        assert_eq!(destination, expected);
     }
 
     #[test]

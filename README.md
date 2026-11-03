@@ -52,6 +52,17 @@ shotctl --source ~/Pictures/Incoming --config ./shotctl.toml
 
 Use an interactive terminal, preferably 100 columns × 32 rows or larger. Smaller layouts work down to 66 × 22.
 
+## How to update Shotctl
+
+After pulling new changes, rebuild and reinstall from the project directory:
+
+```sh
+source "$HOME/.cargo/env"
+sh scripts/install.sh
+```
+
+Then run `shotctl`. A new terminal alone is not enough — the installed binary only updates when you run the installer.
+
 ## Your first import
 
 1. Choose an archive directory. Type part of a path and press `Tab` to complete folder names, or press `Enter` / `Ctrl+B` to browse folders visually. An absolute path or `~/` works; saving creates the directory if needed.
