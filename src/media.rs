@@ -91,7 +91,9 @@ impl TiffReader<'_> {
         let count = self.u16([count[0], count[1]]) as usize;
         let raw = self.read_at(offset + 2, count * 12)?;
         Ok(raw
-            .chunks_exact(12)
+            .as_chunks::<12>()
+            .0
+            .iter()
             .map(|entry| TiffEntry {
                 tag: self.u16([entry[0], entry[1]]),
                 kind: self.u16([entry[2], entry[3]]),

@@ -1,8 +1,21 @@
 # shotctl
 
-A Rust and Ratatui terminal app for importing camera photos into an organized archive. A compact configuration header, selectable tables, and keyboard shortcuts take inspiration from k9s.
+A fast, keyboard-driven terminal app for importing photos from your SD card. Preview exactly where every photo will land, skip duplicates, and import with confidence.
 
-## Run
+Source and issues: [github.com/kontryx/shotctl](https://github.com/kontryx/shotctl)
+
+## Install with Homebrew
+
+On macOS or Linux with [Homebrew](https://brew.sh):
+
+```sh
+brew install kontryx/shotctl/shotctl
+shotctl
+```
+
+Upgrade later with `brew upgrade shotctl`.
+
+## Run from source
 
 With Rust 1.88 or newer installed:
 
@@ -54,7 +67,7 @@ Use an interactive terminal, preferably 100 columns × 32 rows or larger. Smalle
 
 ## How to update Shotctl
 
-After pulling new changes, rebuild and reinstall from the project directory:
+If you installed with Homebrew, run `brew upgrade shotctl`. For a source install, after pulling new changes, rebuild and reinstall from the project directory:
 
 ```sh
 source "$HOME/.cargo/env"
@@ -110,9 +123,8 @@ The month preset intentionally shares month folders across years; the full date 
 | `s` | Enter a source directory |
 | `r` | Refresh detected cards; rescan from a preview |
 | `c` | Edit configuration |
-| `f` / `Tab` | Switch between folder and file previews |
+| `f` / `Tab` | Switch between folder and file previews; after a successful import that created one new folder, `f` opens that folder |
 | `o` | In the folder preview, open the highlighted folder if it is already in the archive; after a successful import, open the archive folder |
-| `f` | After a successful import that created one new folder, open that folder |
 | `p` | After a successful import, open the folder containing the new folders (the parent of a single new folder, or the one shared by several) |
 | `Space` | In the folder preview, select or deselect the highlighted new folder |
 | `a` | In the folder preview, select all new folders, or deselect them all if every one is already selected |
@@ -154,7 +166,7 @@ Configuration is saved as TOML. `XDG_CONFIG_HOME`, when set, takes precedence. O
 
 - macOS: `~/Library/Application Support/shotctl/config.toml`
 - Linux: `~/.config/shotctl/config.toml`
-- Windows: `%APPDATA%\shotctl\config.toml` (manual source selection is available; automatic detection is intended for macOS and Linux).
+- Windows: `%APPDATA%\shotctl\config.toml` (build with Cargo; automatic volume detection probes drive letters, but the installer script is macOS/Linux only).
 
 Use `--config PATH` for a separate profile. Example:
 
@@ -166,6 +178,18 @@ date_basis = "capture"
 ```
 
 The Rust modules separate configuration, media detection and metadata, import planning and copying, application state, and rendering.
+
+## Troubleshooting
+
+- **Terminal too small.** Prefer at least 100×32; layouts work down to 66×22. Enlarge the window if controls look clipped.
+- **Card not listed.** Press `r` after mounting, or press `s` and choose the photo directory. Automatic detection looks for a `DCIM` folder on mounted volumes (macOS/Linux) or drive letters (Windows).
+- **Unexpected duplicates or missing skips.** Deduplication is destination-based. Changing layout, grouping, or date basis can place the same photo in a new folder. Delete `hash-cache.tsv` next to the config file to force full re-hashing.
+- **Leftover `.shotctl-*.partial` files.** A force quit or power loss can leave them; they are never treated as completed photos and can be deleted.
+- **Import fails on publish.** Some filesystems lack exclusive rename and hard-link fallbacks; retry after a new preview once the destination is writable.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ## Development
 

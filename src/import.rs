@@ -786,6 +786,7 @@ fn duplicate_candidates(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_in_variants(
     directory: &Path,
     natural: &Path,
@@ -810,6 +811,7 @@ struct Reserved {
     bytes: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_destination(
     directory: &Path,
     natural: &Path,

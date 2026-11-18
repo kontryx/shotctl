@@ -774,10 +774,10 @@ impl App {
                 remaining -= 1;
             }
         }
-        if !rows[index as usize].is_folder() {
-            if let Some(fallback) = rows.iter().position(|row| row.is_folder()) {
-                index = fallback as isize;
-            }
+        if !rows[index as usize].is_folder()
+            && let Some(fallback) = rows.iter().position(|row| row.is_folder())
+        {
+            index = fallback as isize;
         }
         self.preview_state.select(Some(index as usize));
     }
@@ -844,7 +844,8 @@ impl App {
         self.custom_folder_choices
             .iter()
             .zip(self.custom_folder_checked.iter())
-            .filter_map(|(path, checked)| checked.then(|| path.clone()))
+            .filter(|(_, checked)| **checked)
+            .map(|(path, _)| path.clone())
             .collect()
     }
 
