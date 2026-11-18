@@ -2,8 +2,6 @@
 
 A fast, keyboard-driven terminal app for importing photos from your SD card. Preview exactly where every photo will land, skip duplicates, and import with confidence.
 
-Source and issues: [github.com/kontryx/shotctl](https://github.com/kontryx/shotctl)
-
 ## Install with Homebrew
 
 On macOS or Linux with [Homebrew](https://brew.sh):
