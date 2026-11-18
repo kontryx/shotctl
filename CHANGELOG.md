@@ -21,6 +21,6 @@ First public release.
 - Verified copy (temp file → hash check → exclusive publish); originals stay on the source
 - Safe cancel during scan/import; configuration saved as TOML under the platform config directory
 - Installer script for macOS and Linux (`scripts/install.sh`)
-- Homebrew tap: `brew install kontryx/shotctl/shotctl`
+- Homebrew tap: `brew install kontryx/tap/shotctl`
 
 [0.1.0]: https://github.com/kontryx/shotctl/releases/tag/v0.1.0

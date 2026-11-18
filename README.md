@@ -9,7 +9,7 @@ Source and issues: [github.com/kontryx/shotctl](https://github.com/kontryx/shotc
 On macOS or Linux with [Homebrew](https://brew.sh):
 
 ```sh
-brew install kontryx/shotctl/shotctl
+brew install kontryx/tap/shotctl
 shotctl
 ```
 
