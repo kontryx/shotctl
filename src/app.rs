@@ -17,7 +17,7 @@ use ratatui::{DefaultTerminal, widgets::TableState};
 use crate::{
     config::{Config, DateBasis, expand_path},
     directories::{self, Completion, DirectoryBrowser},
-    import::{self, FolderSummary, Plan, SegmentInsert, Summary, WorkerEvent},
+    import::{self, FolderSummary, Plan, ScanCache, SegmentInsert, Summary, WorkerEvent},
     media, ui,
 };
 
@@ -74,6 +74,8 @@ pub struct App {
     pub custom_folder_cursor: usize,
     pub summary: Option<Summary>,
     pub import_archive: Option<PathBuf>,
+    /// Absolute paths of the new folders the last import was set up to create.
+    import_new_folders: Vec<PathBuf>,
     pub message: String,
     pub error: bool,
     pub help: bool,
@@ -87,6 +89,9 @@ pub struct App {
     pub total_bytes: u64,
     pub tick: usize,
     pub detail_scroll: u16,
+    /// Hashes and EXIF dates learned so far; lets a repeat scan skip unchanged files.
+    scan_cache: Arc<ScanCache>,
+    cache_path: PathBuf,
     receiver: Option<Receiver<WorkerEvent>>,
     worker: Option<JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
@@ -95,6 +100,7 @@ pub struct App {
 
 impl App {
     pub fn new(config_path: PathBuf, source: Option<PathBuf>) -> Result<Self> {
+        let cache_path = config_path.with_file_name("hash-cache.tsv");
         let saved = Config::load(&config_path)?;
         let first_run = saved.is_none();
         let config = saved.unwrap_or_default();
@@ -136,6 +142,7 @@ impl App {
             custom_folder_cursor: 0,
             summary: None,
             import_archive: None,
+            import_new_folders: Vec::new(),
             message: String::new(),
             error: false,
             help: false,
@@ -149,6 +156,8 @@ impl App {
             total_bytes: 0,
             tick: 0,
             detail_scroll: 0,
+            scan_cache: Arc::new(ScanCache::load(&cache_path)),
+            cache_path,
             receiver: None,
             worker: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -184,19 +193,22 @@ impl App {
                     self.current = current;
                 }
                 WorkerEvent::Planned(plan) => {
-                    self.message = if plan.photos.is_empty() {
+                    let empty = plan.photos.is_empty();
+                    // Store the plan first: the message depends on its new folders.
+                    self.plan = Some(plan);
+                    self.scan_cache.save(&self.cache_path);
+                    self.message = if empty {
                         "No supported photos found. Press Esc to choose another source.".into()
                     } else if self.segment_insert.is_some() {
                         "Custom folder active. Press n to change or clear, Enter to confirm.".into()
                     } else {
-                        "Review folders. Press n for a custom folder, or Enter to confirm.".into()
+                        self.review_message()
                     };
-                    self.plan = Some(plan);
+                    self.error = false;
                     self.screen = Screen::Preview;
                     self.show_files = false;
-                    self.preview_state = TableState::default().with_selected(Some(
-                        self.first_selectable_preview_row().unwrap_or(0),
-                    ));
+                    self.preview_state = TableState::default()
+                        .with_selected(Some(self.first_selectable_preview_row().unwrap_or(0)));
                     self.finish_worker();
                 }
                 WorkerEvent::Progress {
@@ -213,6 +225,7 @@ impl App {
                     self.current = current;
                 }
                 WorkerEvent::Finished(summary) => {
+                    self.scan_cache.save(&self.cache_path);
                     self.screen = Screen::Done;
                     self.summary = Some(summary);
                     self.detail_scroll = 0;
@@ -285,19 +298,22 @@ impl App {
         self.current.clear();
         self.plan = None;
         self.import_archive = None;
+        self.import_new_folders.clear();
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         let config = self.config.clone();
         let segment_insert = self.segment_insert.clone();
+        let cache = self.scan_cache.clone();
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
         self.worker = Some(thread::spawn(move || {
-            let event = match import::build_plan(
+            let event = match import::build_plan_cached(
                 &source,
                 &config,
                 segment_insert.as_ref(),
                 &tx,
                 &cancel,
+                &cache,
             ) {
                 Ok(plan) => WorkerEvent::Planned(plan),
                 Err(e) => WorkerEvent::Failed(format!("{e:#}")),
@@ -309,6 +325,12 @@ impl App {
     fn start_import(&mut self) {
         let Some(plan) = self.plan.take() else { return };
         self.import_archive = Some(plan.archive.clone());
+        self.import_new_folders = plan
+            .folders()
+            .into_iter()
+            .filter(|folder| !folder.exists && folder.included && folder.copy > 0)
+            .map(|folder| plan.archive.join(folder.path))
+            .collect();
         self.confirming = false;
         self.screen = Screen::Importing;
         self.clear_message();
@@ -356,6 +378,90 @@ impl App {
             self.import_archive.as_deref()
         } else {
             None
+        }
+    }
+
+    /// New folders this import created, once it has finished cleanly.
+    pub fn created_folders(&self) -> Vec<&Path> {
+        if self.completed_archive().is_none() {
+            return Vec::new();
+        }
+        self.import_new_folders
+            .iter()
+            .map(PathBuf::as_path)
+            .filter(|path| path.is_dir())
+            .collect()
+    }
+
+    /// The one folder that was created, when exactly one was.
+    pub fn created_folder(&self) -> Option<&Path> {
+        match self.created_folders().as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// The folder that contains everything that was created: the parent of a single
+    /// new folder, or the deepest folder shared by several. Never the archive itself,
+    /// which has its own shortcut.
+    pub fn created_parent(&self) -> Option<PathBuf> {
+        let archive = self.completed_archive()?;
+        let folders = self.created_folders();
+        let parent = match folders.as_slice() {
+            [] => return None,
+            [only] => only.parent()?.to_path_buf(),
+            [first, rest @ ..] => {
+                let mut shared: PathBuf = first.to_path_buf();
+                for other in rest {
+                    while !other.starts_with(&shared) {
+                        if !shared.pop() {
+                            return None;
+                        }
+                    }
+                }
+                shared
+            }
+        };
+        (parent.starts_with(archive) && parent != archive).then_some(parent)
+    }
+
+    /// `o` in the folder preview: open the highlighted folder if it is already archived.
+    fn open_selected_folder(&mut self) {
+        let Some(folder) = self.selected_preview_folder() else {
+            return;
+        };
+        if !folder.exists {
+            self.message = "That folder doesn't exist yet; it is created when you import.".into();
+            self.error = false;
+            return;
+        }
+        let Some(archive) = self.plan.as_ref().map(|plan| plan.archive.clone()) else {
+            return;
+        };
+        self.open_in_file_manager(&archive.join(&folder.path), "the folder");
+    }
+
+    fn open_created_folder(&mut self) {
+        let Some(folder) = self.created_folder().map(Path::to_owned) else {
+            return;
+        };
+        self.open_in_file_manager(&folder, "the new folder");
+    }
+
+    fn open_created_parent(&mut self) {
+        let Some(parent) = self.created_parent() else {
+            return;
+        };
+        self.open_in_file_manager(&parent, "the parent folder");
+    }
+
+    fn open_in_file_manager(&mut self, path: &Path, what: &str) {
+        match open_folder(path) {
+            Ok(()) => {
+                self.clear_message();
+                self.message = format!("Opened {what}.");
+            }
+            Err(error) => self.set_error(format!("Could not open {what}: {error:#}")),
         }
     }
 
@@ -465,13 +571,14 @@ impl App {
             }
             KeyCode::Esc if self.screen == Screen::Preview && self.show_files => {
                 self.show_files = false;
-                self.preview_state = TableState::default().with_selected(
-                    Some(self.first_selectable_preview_row().unwrap_or(0)),
-                );
+                self.preview_state = TableState::default()
+                    .with_selected(Some(self.first_selectable_preview_row().unwrap_or(0)));
             }
             KeyCode::Esc => {
                 self.screen = Screen::Sources;
                 self.plan = None;
+                // A custom folder is a one-time choice for this preview.
+                self.clear_custom_folder();
                 self.clear_message();
             }
             _ => match self.screen {
@@ -489,13 +596,12 @@ impl App {
                 Screen::Preview => match key.code {
                     KeyCode::Char('f') | KeyCode::Tab => {
                         self.show_files = !self.show_files;
-                        self.preview_state = TableState::default().with_selected(Some(
-                            if self.show_files {
+                        self.preview_state =
+                            TableState::default().with_selected(Some(if self.show_files {
                                 0
                             } else {
                                 self.first_selectable_preview_row().unwrap_or(0)
-                            },
-                        ));
+                            }));
                     }
                     KeyCode::Char('n') if !self.show_files => {
                         self.open_custom_folder_dialog();
@@ -503,11 +609,10 @@ impl App {
                     KeyCode::Char('x') if !self.show_files && self.segment_insert.is_some() => {
                         self.clear_applied_custom_folder();
                     }
-                    KeyCode::Enter | KeyCode::Char('i') => {
-                        if self.plan.as_ref().is_some_and(|p| !p.photos.is_empty()) {
-                            self.confirming = true;
-                        }
-                    }
+                    KeyCode::Char(' ') if !self.show_files => self.toggle_selected_new_folder(),
+                    KeyCode::Char('a') if !self.show_files => self.toggle_all_new_folders(),
+                    KeyCode::Char('o') if !self.show_files => self.open_selected_folder(),
+                    KeyCode::Enter | KeyCode::Char('i') => self.request_confirmation(),
                     KeyCode::Char('r') => self.scan(),
                     KeyCode::Down | KeyCode::Char('j') => self.move_preview(1),
                     KeyCode::Up | KeyCode::Char('k') => self.move_preview(-1),
@@ -517,6 +622,8 @@ impl App {
                 },
                 Screen::Done => match key.code {
                     KeyCode::Char('o') => self.open_archive(),
+                    KeyCode::Char('f') => self.open_created_folder(),
+                    KeyCode::Char('p') => self.open_created_parent(),
                     KeyCode::Enter | KeyCode::Char('r') => {
                         self.screen = Screen::Sources;
                         self.clear_custom_folder();
@@ -533,6 +640,84 @@ impl App {
                 _ => {}
             },
         }
+    }
+
+    fn review_message(&self) -> String {
+        let has_new = self
+            .plan
+            .as_ref()
+            .is_some_and(|plan| !plan.new_folder_layouts().is_empty());
+        if has_new {
+            "Review folders. Space selects a new folder, a selects all, n adds a custom folder, Enter confirms."
+                .into()
+        } else {
+            "Review folders. Press n for a custom folder, or Enter to confirm.".into()
+        }
+    }
+
+    fn request_confirmation(&mut self) {
+        let Some(plan) = &self.plan else { return };
+        if plan.photos.is_empty() {
+            return;
+        }
+        if plan.copy_count() == 0 {
+            let message = if plan.excluded_count() > 0 {
+                "No new folders are selected, so nothing would be imported. Press a to select them, or Esc to go back."
+            } else {
+                "Nothing to import: every photo is already in the archive. Press Esc to choose another source."
+            };
+            self.set_error(message.into());
+            return;
+        }
+        self.clear_message();
+        self.confirming = true;
+    }
+
+    fn new_folder_selection_message(&self) -> String {
+        let Some(plan) = &self.plan else {
+            return String::new();
+        };
+        let total = plan.new_folder_layouts().len();
+        let included = total - plan.excluded.len().min(total);
+        match (included, total) {
+            (_, 0) => "No new folders will be created.".into(),
+            (n, t) if n == t => format!("All {t} new folders will be created."),
+            (0, t) => format!("None of the {t} new folders will be created."),
+            (n, t) => format!("{n} of {t} new folders will be created."),
+        }
+    }
+
+    /// Space: include or exclude the highlighted new folder.
+    fn toggle_selected_new_folder(&mut self) {
+        let Some(folder) = self.selected_preview_folder() else {
+            return;
+        };
+        if folder.exists {
+            self.message =
+                "Existing folders are always used; only new folders can be selected.".into();
+            self.error = false;
+            return;
+        }
+        if let Some(plan) = self.plan.as_mut() {
+            plan.toggle_new_folder(&folder.layout);
+        }
+        self.message = self.new_folder_selection_message();
+        self.error = false;
+    }
+
+    /// `a`: create every new folder, or none of them if all are already selected.
+    fn toggle_all_new_folders(&mut self) {
+        let Some(plan) = self.plan.as_mut() else {
+            return;
+        };
+        let total = plan.new_folder_layouts().len();
+        if total == 0 {
+            return;
+        }
+        let all_included = plan.excluded.is_empty();
+        plan.set_all_new_folders(!all_included);
+        self.message = self.new_folder_selection_message();
+        self.error = false;
     }
 
     fn preview_len(&self) -> usize {
@@ -614,14 +799,10 @@ impl App {
 
     fn refresh_custom_folder_choices(&mut self) {
         let choices = self.new_folder_layout_paths();
-        let previously_checked: std::collections::BTreeSet<PathBuf> =
-            match &self.segment_insert {
-                Some(SegmentInsert::Selected { folders, .. }) => folders.iter().cloned().collect(),
-                _ => self
-                    .selected_new_folder_layout_path()
-                    .into_iter()
-                    .collect(),
-            };
+        let previously_checked: std::collections::BTreeSet<PathBuf> = match &self.segment_insert {
+            Some(SegmentInsert::Selected { folders, .. }) => folders.iter().cloned().collect(),
+            _ => self.selected_new_folder_layout_path().into_iter().collect(),
+        };
         let mut checked: Vec<bool> = choices
             .iter()
             .map(|path| previously_checked.contains(path))
@@ -651,7 +832,7 @@ impl App {
         let mut paths = Vec::new();
         for folder in plan.folders() {
             let natural = self.natural_layout_path(&folder.path);
-            let is_new = !plan.archive.join(&natural).exists();
+            let is_new = !folder.exists && !plan.archive.join(&natural).exists();
             if is_new && !paths.iter().any(|path| path == &natural) {
                 paths.push(natural);
             }
@@ -706,7 +887,9 @@ impl App {
                 self.custom_folder_input = None;
                 self.clear_message();
             }
-            KeyCode::Char('x') => {
+            // Every printable key, including `x` and Space, belongs to the name; the
+            // dialog's commands use keys that can't be part of a folder name.
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.clear_applied_custom_folder();
             }
             KeyCode::Left => {
@@ -732,7 +915,7 @@ impl App {
                 self.custom_folder_cursor = (self.custom_folder_cursor + 1).min(max);
                 self.clear_message();
             }
-            KeyCode::Char(' ')
+            KeyCode::Tab
                 if self.custom_folder_scope == CustomFolderScope::SelectedFolder
                     && !self.custom_folder_checked.is_empty() =>
             {
@@ -757,7 +940,7 @@ impl App {
                             let folders = self.checked_custom_folders();
                             if folders.is_empty() {
                                 self.set_error(
-                                    "Check at least one new folder with Space, then Apply.".into(),
+                                    "Select at least one new folder with Tab, then Apply.".into(),
                                 );
                                 return;
                             }
@@ -828,7 +1011,7 @@ impl App {
                 self.message = if self.segment_insert.is_some() {
                     "Custom folder active. Press n to change or clear, Enter to confirm.".into()
                 } else {
-                    "Review folders. Press n for a custom folder, or Enter to confirm.".into()
+                    self.review_message()
                 };
                 self.error = false;
             }
@@ -874,6 +1057,7 @@ impl App {
                         self.source_input = None;
                         self.screen = Screen::Sources;
                         self.plan = None;
+                        self.clear_custom_folder();
                         self.clear_message();
                     }
                     _ => self.set_error(
@@ -1285,6 +1469,407 @@ mod tests {
     }
 
     #[test]
+    fn new_folders_can_be_toggled_individually_or_all_at_once_before_importing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let card = temp.path().join("card");
+        fs::create_dir(&card).unwrap();
+        fs::write(card.join("photo.JPG"), b"jpeg data").unwrap();
+        fs::write(card.join("photo.ARW"), b"raw data").unwrap();
+        let archive = temp.path().join("archive");
+        let config_path = temp.path().join("config.toml");
+        Config {
+            archive: archive.clone(),
+            ..Config::default()
+        }
+        .save(&config_path)
+        .unwrap();
+        let mut app = App::new(config_path, Some(card)).unwrap();
+        press(&mut app, KeyCode::Enter);
+        wait_for(&mut app, Screen::Preview);
+        assert_eq!(app.plan.as_ref().unwrap().copy_count(), 2);
+
+        // Space excludes the highlighted new folder; pressing it again restores it.
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.plan.as_ref().unwrap().copy_count(), 1);
+        assert!(app.message.contains("1 of 2"), "{}", app.message);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.plan.as_ref().unwrap().copy_count(), 2);
+
+        // `a` excludes every new folder, and a second press includes them all again.
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.plan.as_ref().unwrap().copy_count(), 0);
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.confirming && app.error);
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.plan.as_ref().unwrap().copy_count(), 2);
+
+        // Only the chosen folder is created on import.
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.confirming);
+        press(&mut app, KeyCode::Char('y'));
+        wait_for(&mut app, Screen::Done);
+        let summary = app.summary.as_ref().unwrap();
+        assert_eq!((summary.copied, summary.failed), (1, 0));
+        let files = walkdir::WalkDir::new(&archive)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+        assert_eq!(files, 1);
+    }
+
+    fn screen_text(app: &mut App) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..40)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn example_and_dialog_always_reflect_the_applied_custom_folder() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let card = temp.path().join("card");
+        fs::create_dir(&card).unwrap();
+        fs::write(card.join("photo.JPG"), b"jpeg data").unwrap();
+        let config_path = temp.path().join("config.toml");
+        Config {
+            archive: temp.path().join("archive"),
+            ..Config::default()
+        }
+        .save(&config_path)
+        .unwrap();
+        let mut app = App::new(config_path, Some(card)).unwrap();
+        press(&mut app, KeyCode::Enter);
+        wait_for(&mut app, Screen::Preview);
+        let example_line = |text: &str| {
+            text.lines()
+                .find(|line| line.contains("Example"))
+                .unwrap()
+                .to_owned()
+        };
+        assert!(!example_line(&screen_text(&mut app)).contains("demo-trip"));
+
+        press(&mut app, KeyCode::Char('n'));
+        assert!(screen_text(&mut app).contains("Applied now: no custom folder"));
+        for ch in "demo-trip".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+        // The header example follows the applied custom folder once the dialog closes.
+        let example = example_line(&screen_text(&mut app));
+        assert!(
+            example.contains("/demo-trip/2026-10-22-RAW"),
+            "stale example: {example}"
+        );
+
+        // Reopening shows what is applied, and flags edits that are not applied yet.
+        press(&mut app, KeyCode::Char('n'));
+        let dialog = screen_text(&mut app);
+        assert!(dialog.contains("Applied now: demo-trip/"));
+        assert!(!dialog.contains("isn't applied"));
+        press(&mut app, KeyCode::Backspace);
+        assert!(screen_text(&mut app).contains("isn't applied"));
+        press(&mut app, KeyCode::Esc);
+        assert!(example_line(&screen_text(&mut app)).contains("/demo-trip/"));
+
+        // Removing it puts the plain example back.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!example_line(&screen_text(&mut app)).contains("demo-trip"));
+    }
+
+    fn preview_app(files: &[(&str, &[u8])]) -> (tempfile::TempDir, App) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let card = temp.path().join("card");
+        fs::create_dir(&card).unwrap();
+        for (name, contents) in files {
+            fs::write(card.join(name), contents).unwrap();
+        }
+        let config_path = temp.path().join("config.toml");
+        Config {
+            archive: temp.path().join("archive"),
+            ..Config::default()
+        }
+        .save(&config_path)
+        .unwrap();
+        let mut app = App::new(config_path, Some(card)).unwrap();
+        press(&mut app, KeyCode::Enter);
+        wait_for(&mut app, Screen::Preview);
+        (temp, app)
+    }
+
+    #[test]
+    fn folder_names_can_contain_x_and_spaces_in_every_scope() {
+        let (_temp, mut app) = preview_app(&[("photo.JPG", b"jpeg data")]);
+        for scope_right_presses in [0, 1] {
+            press(&mut app, KeyCode::Char('n'));
+            for _ in 0..scope_right_presses {
+                press(&mut app, KeyCode::Right);
+            }
+            app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            for ch in "xmas trip x".chars() {
+                press(&mut app, KeyCode::Char(ch));
+            }
+            assert_eq!(app.custom_folder_input.as_deref(), Some("xmas trip x"));
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(
+                app.segment_insert.as_ref().map(SegmentInsert::name),
+                Some("xmas trip x")
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_x_removes_the_applied_custom_folder_from_the_dialog() {
+        let (_temp, mut app) = preview_app(&[("photo.JPG", b"jpeg data")]);
+        press(&mut app, KeyCode::Char('n'));
+        for ch in "Trip".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.segment_insert.is_some());
+        press(&mut app, KeyCode::Char('n'));
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(app.segment_insert.is_none() && app.custom_folder_input.is_none());
+    }
+
+    #[test]
+    fn tab_selects_folders_in_the_choose_folders_scope() {
+        let (_temp, mut app) = preview_app(&[("a.JPG", b"jpeg"), ("b.ARW", b"raw")]);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Left); // Choose folders
+        assert_eq!(app.custom_folder_scope, CustomFolderScope::SelectedFolder);
+        let before = app.custom_folder_checked.clone();
+        press(&mut app, KeyCode::Tab);
+        assert_ne!(app.custom_folder_checked, before);
+        assert_eq!(app.custom_folder_input.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn first_scan_message_explains_how_to_select_new_folders() {
+        let (_temp, app) = preview_app(&[("photo.JPG", b"jpeg data")]);
+        assert!(app.message.contains("Space selects"), "{}", app.message);
+    }
+
+    #[test]
+    fn importing_when_everything_is_already_archived_explains_instead_of_confirming() {
+        let (_temp, mut app) = preview_app(&[("photo.JPG", b"jpeg data")]);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('y'));
+        wait_for(&mut app, Screen::Done);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        wait_for(&mut app, Screen::Preview);
+        assert_eq!(app.plan.as_ref().unwrap().copy_count(), 0);
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.confirming && app.error);
+        assert!(
+            app.message.contains("already in the archive"),
+            "{}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn leaving_a_preview_forgets_its_one_time_custom_folder() {
+        let (_temp, mut app) = preview_app(&[("photo.JPG", b"jpeg data")]);
+        press(&mut app, KeyCode::Char('n'));
+        for ch in "Trip".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.segment_insert.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.screen == Screen::Sources && app.segment_insert.is_none());
+        press(&mut app, KeyCode::Enter);
+        wait_for(&mut app, Screen::Preview);
+        assert!(app.segment_insert.is_none());
+        let destination = &app.plan.as_ref().unwrap().photos[0].destination;
+        assert!(!destination.to_string_lossy().contains("Trip"));
+    }
+
+    fn import_everything(app: &mut App) {
+        press(app, KeyCode::Enter);
+        press(app, KeyCode::Char('y'));
+        wait_for(app, Screen::Done);
+    }
+
+    #[test]
+    fn finished_import_offers_the_single_new_folder_and_its_parent() {
+        let (_temp, mut app) = preview_app(&[("photo.JPG", b"jpeg data")]);
+        import_everything(&mut app);
+        let archive = app.completed_archive().unwrap().to_owned();
+        let folder = app
+            .created_folder()
+            .expect("one folder was created")
+            .to_owned();
+        assert!(folder.is_dir() && folder.starts_with(&archive));
+        let parent = app.created_parent().expect("parent below the archive");
+        assert_eq!(Some(parent.as_path()), folder.parent());
+        assert_ne!(parent, archive);
+        let text = screen_text(&mut app);
+        assert!(text.contains("Press f to open the new folder"), "{text}");
+        assert!(text.contains("Press p to open its parent"), "{text}");
+        assert!(text.contains("[f] Open new folder") && text.contains("[p] Open parent"));
+    }
+
+    #[test]
+    fn several_new_folders_offer_only_their_shared_parent() {
+        let (_temp, mut app) = preview_app(&[("a.JPG", b"jpeg"), ("b.ARW", b"raw")]);
+        import_everything(&mut app);
+        assert_eq!(app.created_folders().len(), 2);
+        assert!(app.created_folder().is_none());
+        let parent = app.created_parent().expect("shared parent");
+        assert!(
+            app.created_folders()
+                .iter()
+                .all(|f| f.parent() == Some(parent.as_path()))
+        );
+        let text = screen_text(&mut app);
+        assert!(
+            text.contains("Press p to open the folder containing the new folders"),
+            "{text}"
+        );
+        assert!(!text.contains("Press f"), "{text}");
+    }
+
+    #[test]
+    fn only_folders_that_were_actually_created_are_offered() {
+        let (_temp, mut app) = preview_app(&[("a.JPG", b"jpeg"), ("b.ARW", b"raw")]);
+        press(&mut app, KeyCode::Char(' ')); // Deselect the highlighted new folder.
+        import_everything(&mut app);
+        assert_eq!(app.created_folders().len(), 1);
+        assert!(app.created_folder().is_some());
+    }
+
+    #[test]
+    fn nothing_is_offered_when_the_new_folder_is_the_archive_root_or_the_import_failed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let card = temp.path().join("card");
+        fs::create_dir(&card).unwrap();
+        fs::write(card.join("photo.JPG"), b"jpeg data").unwrap();
+        let config_path = temp.path().join("config.toml");
+        Config {
+            archive: temp.path().join("archive"),
+            layout: crate::config::Layout::Date,
+            ..Config::default()
+        }
+        .save(&config_path)
+        .unwrap();
+        let mut app = App::new(config_path, Some(card)).unwrap();
+        press(&mut app, KeyCode::Enter);
+        wait_for(&mut app, Screen::Preview);
+        import_everything(&mut app);
+        // The date folder sits directly in the archive, so a parent shortcut would
+        // only duplicate "open archive".
+        assert!(app.created_folder().is_some());
+        assert!(app.created_parent().is_none());
+
+        app.summary.as_mut().unwrap().failed = 1;
+        assert!(app.created_folders().is_empty() && app.created_folder().is_none());
+    }
+
+    #[test]
+    fn hashes_learned_during_an_import_are_saved_next_to_the_config() {
+        let (temp, mut app) = preview_app(&[("photo.JPG", b"jpeg data")]);
+        let cache_file = temp.path().join("hash-cache.tsv");
+        assert!(!cache_file.exists());
+        import_everything(&mut app);
+        let saved = fs::read_to_string(&cache_file).unwrap();
+        assert!(saved.starts_with("shotctl-hash-cache 1\n"));
+        assert!(saved.lines().count() >= 2);
+    }
+
+    #[test]
+    fn archived_folders_show_their_import_date_when_there_is_room() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let (_temp, mut app) = preview_app(&[("photo.JPG", b"jpeg data")]);
+        import_everything(&mut app);
+        press(&mut app, KeyCode::Enter); // New import
+        press(&mut app, KeyCode::Enter); // Scan again: the folder now exists
+        wait_for(&mut app, Screen::Preview);
+        assert!(
+            app.plan
+                .as_ref()
+                .unwrap()
+                .folders()
+                .iter()
+                .all(|f| f.exists)
+        );
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let supported = fs::metadata(&app.config.archive)
+            .and_then(|metadata| metadata.created())
+            .is_ok();
+        let draw = |app: &mut App, width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+            terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..40)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let wide = draw(&mut app, 120);
+        assert!(wide.contains("IMPORTED"), "{wide}");
+        // The detail line wraps on long temp paths, so look for the label only.
+        assert_eq!(wide.contains("· imported"), supported, "{wide}");
+        let table_row = wide.lines().find(|line| line.contains("JPEG/")).unwrap();
+        assert_eq!(table_row.contains(&today), supported, "{table_row}");
+        if !supported {
+            assert!(table_row.contains('—'));
+        }
+        // Narrow terminals drop the column rather than squeezing the folder names.
+        let narrow = draw(&mut app, 66);
+        assert!(!narrow.contains("IMPORTED"), "{narrow}");
+        assert!(narrow.contains("JPEG/"));
+    }
+
+    #[test]
+    fn o_opens_only_folders_that_are_already_archived() {
+        // A new folder doesn't exist yet: explain instead of trying to open it.
+        let (_temp, mut app) = preview_app(&[("photo.JPG", b"jpeg data")]);
+        assert!(!app.selected_preview_folder().unwrap().exists);
+        assert!(!screen_text(&mut app).contains("[o] Open folder"));
+        press(&mut app, KeyCode::Char('o'));
+        assert!(
+            !app.error && app.message.contains("doesn't exist yet"),
+            "{}",
+            app.message
+        );
+
+        // After importing, the folder is archived and `o` is offered for it.
+        import_everything(&mut app);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        wait_for(&mut app, Screen::Preview);
+        let folder = app.selected_preview_folder().unwrap();
+        assert!(folder.exists);
+        assert!(screen_text(&mut app).contains("[o] Open folder"));
+        // Existence is checked live: if it vanishes, `o` explains instead of opening
+        // anything (and never launches a file manager from the test).
+        let path = app.plan.as_ref().unwrap().archive.join(&folder.path);
+        fs::remove_dir_all(&path).unwrap();
+        assert!(!screen_text(&mut app).contains("[o] Open folder"));
+        press(&mut app, KeyCode::Char('o'));
+        assert!(app.message.contains("doesn't exist yet"), "{}", app.message);
+        // The file view has no folder to open.
+        press(&mut app, KeyCode::Char('f'));
+        assert!(!screen_text(&mut app).contains("[o] Open folder"));
+    }
+
+    #[test]
     fn custom_folder_all_new_can_be_set_cleared_and_is_reset_from_settings() {
         let temp = tempfile::TempDir::new().unwrap();
         let card = temp.path().join("card");
@@ -1301,9 +1886,7 @@ mod tests {
         let mut app = App::new(config_path, Some(card)).unwrap();
         press(&mut app, KeyCode::Enter);
         wait_for(&mut app, Screen::Preview);
-        let layout = app.plan.as_ref().unwrap().photos[0]
-            .layout_relative
-            .clone();
+        let layout = app.plan.as_ref().unwrap().photos[0].layout_relative.clone();
         press(&mut app, KeyCode::Char('n'));
         assert!(app.custom_folder_input.is_some());
         assert_eq!(app.custom_folder_scope, CustomFolderScope::AllNewFolders);
@@ -1324,9 +1907,11 @@ mod tests {
             .to_owned();
         assert_eq!(
             destination,
-            app.plan.as_ref().unwrap().archive.join(import::insert_segment_before_leaf(
-                &layout, "MyTrip"
-            ))
+            app.plan
+                .as_ref()
+                .unwrap()
+                .archive
+                .join(import::insert_segment_before_leaf(&layout, "MyTrip"))
         );
         press(&mut app, KeyCode::Char('n'));
         app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));

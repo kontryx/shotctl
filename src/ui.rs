@@ -73,22 +73,22 @@ fn border(title: &str) -> Block<'_> {
         .style(Style::default().bg(PANEL).fg(TEXT))
 }
 
-fn shortcut_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+fn shortcut_lines(app: &App, width: u16, roomy: bool) -> Vec<Line<'static>> {
     let shortcuts: &[(&str, &str)] = if app.custom_folder_input.is_some() {
         if app.custom_folder_scope == CustomFolderScope::SelectedFolder {
             &[
-                ("←→", "Scope"),
+                ("←→", "Switch scope"),
                 ("↑↓", "List"),
-                ("Space", "Check"),
+                ("Tab", "Select"),
                 ("Enter", "Apply"),
-                ("x", "Remove"),
+                ("Ctrl+X", "Remove"),
                 ("Esc", "Back"),
             ]
         } else {
             &[
-                ("←→", "Scope"),
+                ("←→", "Switch scope"),
                 ("Enter", "Apply"),
-                ("x", "Remove"),
+                ("Ctrl+X", "Remove"),
                 ("Esc", "Back"),
             ]
         }
@@ -168,9 +168,53 @@ fn shortcut_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             ],
         }
     };
+    let mut shortcuts = shortcuts.to_vec();
+    if app.screen == Screen::Done
+        && let Some(at) = shortcuts.iter().position(|(key, _)| *key == "o")
+    {
+        let mut extra = Vec::new();
+        if app.created_folder().is_some() {
+            extra.push(("f", "Open new folder"));
+        }
+        if app.created_parent().is_some() {
+            extra.push(("p", "Open parent"));
+        }
+        for (offset, item) in extra.into_iter().enumerate() {
+            shortcuts.insert(at + 1 + offset, item);
+        }
+    }
+    let selecting_folders = roomy
+        && app.screen == Screen::Preview
+        && !app.show_files
+        && app.custom_folder_input.is_none()
+        && app.directory_browser.is_none()
+        && app
+            .plan
+            .as_ref()
+            .is_some_and(|plan| !plan.new_folder_layouts().is_empty());
+    if selecting_folders {
+        shortcuts.insert(1, ("Space", "Select"));
+        shortcuts.insert(2, ("a", "Select all"));
+    }
+    // Archived folders can be opened; new ones don't exist yet.
+    if roomy
+        && app.screen == Screen::Preview
+        && !app.show_files
+        && app.custom_folder_input.is_none()
+        && app.directory_browser.is_none()
+        && app
+            .selected_preview_folder()
+            .is_some_and(|folder| folder.exists)
+    {
+        let at = shortcuts
+            .iter()
+            .position(|(key, _)| *key == "f")
+            .map_or(shortcuts.len(), |index| index + 1);
+        shortcuts.insert(at, ("o", "Open folder"));
+    }
     let mut lines = Vec::new();
     let mut line = Line::default();
-    for &(key, action) in shortcuts {
+    for &(key, action) in &shortcuts {
         let group = Line::from(vec![
             Span::styled(format!("[{key}]"), accent().bg(SELECTED)),
             Span::styled(format!(" {action}"), Style::default().fg(TEXT)),
@@ -199,7 +243,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .style(Style::default().fg(CYAN)).wrap(Wrap { trim: false }), area);
         return;
     }
-    let hints = shortcut_lines(app, area.width.saturating_sub(2));
+    let hints = shortcut_lines(app, area.width.saturating_sub(2), area.height >= 24);
     let regions = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(if area.height < 32 { 5 } else { 7 }),
@@ -256,6 +300,48 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// Sample destination path. Shows the applied custom folder, so the example
+/// always matches where photos will really go.
+fn example_line(config: &crate::config::Config, app: &App) -> Line<'static> {
+    let label = Span::styled(" Example  ", muted());
+    let plain = config.example();
+    let custom = app
+        .segment_insert
+        .as_ref()
+        .filter(|_| app.screen != Screen::Settings);
+    let Some(insert) = custom else {
+        return Line::from(vec![label, Span::raw(plain)]);
+    };
+    let example = std::path::PathBuf::from(&plain);
+    let relative = example
+        .strip_prefix(&config.archive)
+        .unwrap_or(&example)
+        .to_owned();
+    let parent = relative
+        .parent()
+        .map(|p| format!("{}/", p.display()))
+        .filter(|p| p != "/")
+        .unwrap_or_default();
+    let leaf = relative
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let scope = match insert {
+        SegmentInsert::Selected { .. } => "custom folder · chosen folders only",
+        SegmentInsert::AllNew { .. } => "custom folder · new folders",
+    };
+    Line::from(vec![
+        label,
+        Span::raw(format!("{}/{parent}", config.archive.display())),
+        Span::styled(
+            insert.name().to_owned(),
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("/{leaf}")),
+        Span::styled(format!("  ({scope})"), muted()),
+    ])
+}
+
 fn header(frame: &mut Frame, app: &App, area: Rect) {
     let mut config = if app.screen == Screen::Settings {
         app.draft.clone()
@@ -282,10 +368,7 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("    Mode  ", muted()),
             Span::styled("Copy + verify", Style::default().fg(GREEN)),
         ]),
-        Line::from(vec![
-            Span::styled(" Example  ", muted()),
-            Span::raw(config.example()),
-        ]),
+        example_line(&config, app),
         Line::from(vec![
             Span::styled(" Source   ", muted()),
             Span::raw(
@@ -526,6 +609,12 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(YELLOW),
         ),
     ])];
+    if plan.excluded_count() > 0 {
+        metrics[0].spans.push(Span::styled(
+            format!("    {} not selected", plan.excluded_count()),
+            Style::default().fg(RED),
+        ));
+    }
     if let Some(insert) = &app.segment_insert {
         let scope_label = match insert {
             SegmentInsert::Selected { folders, .. } if folders.len() != 1 => {
@@ -570,10 +659,15 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
                     .destination
                     .strip_prefix(&plan.archive)
                     .unwrap_or(&photo.destination);
-                let action = match photo.action {
-                    Action::Copy => "COPY",
-                    Action::Skip => "SKIP",
-                    Action::Rename => "RENAME",
+                let excluded = plan.is_excluded(photo);
+                let action = if excluded {
+                    "UNSELECTED"
+                } else {
+                    match photo.action {
+                        Action::Copy => "COPY",
+                        Action::Skip => "SKIP",
+                        Action::Rename => "RENAME",
+                    }
                 };
                 Row::new(vec![
                     relative.display().to_string(),
@@ -581,11 +675,13 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
                     if photo.fallback { "file date" } else { "" }.into(),
                     human_bytes(photo.bytes),
                 ])
-                .style(Style::default().fg(if photo.action == Action::Skip {
-                    MUTED
-                } else {
-                    TEXT
-                }))
+                .style(Style::default().fg(
+                    if excluded || photo.action == Action::Skip {
+                        MUTED
+                    } else {
+                        TEXT
+                    },
+                ))
             })
             .collect();
         frame.render_stateful_widget(
@@ -593,7 +689,7 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
                 rows,
                 [
                     Constraint::Min(30),
-                    Constraint::Length(7),
+                    Constraint::Length(11),
                     Constraint::Length(9),
                     Constraint::Length(10),
                 ],
@@ -610,11 +706,14 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
             &mut app.preview_state,
         );
     } else {
+        // The import date needs room; narrow terminals keep the essentials.
+        let show_imported = chunks[2].width >= 78;
         let rows: Vec<_> = preview_folder_rows(plan)
             .into_iter()
             .map(|row| match row {
                 PreviewFolderRow::Header { exists: false } => Row::new(vec![
                     "📄→📂  New folders · will be created".into(),
+                    String::new(),
                     String::new(),
                     String::new(),
                     String::new(),
@@ -625,19 +724,33 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
                     String::new(),
                     String::new(),
                     String::new(),
+                    String::new(),
                 ])
                 .style(Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
                 PreviewFolderRow::Folder(folder) => {
                     let (icon, color) = if folder.exists {
                         ("📁", GREEN)
-                    } else {
+                    } else if folder.included {
                         ("📂", CYAN)
+                    } else {
+                        ("📂", MUTED)
+                    };
+                    let checkbox = match (folder.exists, folder.included) {
+                        (true, _) => "",
+                        (false, true) => "[x] ",
+                        (false, false) => "[ ] ",
+                    };
+                    let imported = match (folder.exists, folder.imported) {
+                        (false, _) => String::new(),
+                        (true, Some(date)) => date.format("%Y-%m-%d").to_string(),
+                        (true, None) => "—".into(),
                     };
                     Row::new(vec![
-                        format!("{icon}  {}/", folder.path.display()),
+                        format!("{checkbox}{icon}  {}/", folder.path.display()),
                         folder.copy.to_string(),
                         folder.skip.to_string(),
                         human_bytes(folder.bytes),
+                        imported,
                     ])
                     .style(Style::default().fg(color))
                 }
@@ -651,12 +764,19 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
                     Constraint::Length(8),
                     Constraint::Length(8),
                     Constraint::Length(11),
+                    Constraint::Length(if show_imported { 10 } else { 0 }),
                 ],
             )
             .header(
-                Row::new(["DESTINATION FOLDER", "COPY", "SKIP", "SIZE"])
-                    .style(muted())
-                    .bottom_margin(0),
+                Row::new([
+                    "DESTINATION FOLDER",
+                    "COPY",
+                    "SKIP",
+                    "SIZE",
+                    if show_imported { "IMPORTED" } else { "" },
+                ])
+                .style(muted())
+                .bottom_margin(0),
             )
             .block(border("Folder structure · relative to archive"))
             .row_highlight_style(Style::default().bg(SELECTED).fg(CYAN))
@@ -672,13 +792,26 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|photo| format!("Source: {}", photo.source.display()))
     } else {
         app.preview_state.selected().and_then(|index| {
-            preview_folder_rows(plan).get(index).and_then(|row| match row {
-                PreviewFolderRow::Folder(folder) => Some(format!(
-                    "Destination: {}",
-                    plan.archive.join(&folder.path).display()
-                )),
-                PreviewFolderRow::Header { .. } => None,
-            })
+            preview_folder_rows(plan)
+                .get(index)
+                .and_then(|row| match row {
+                    PreviewFolderRow::Folder(folder) => Some(format!(
+                        "Destination: {}{}{}",
+                        plan.archive.join(&folder.path).display(),
+                        if folder.included {
+                            ""
+                        } else {
+                            " · not selected, will not be created"
+                        },
+                        match folder.imported {
+                            Some(date) if folder.exists => {
+                                format!(" · imported {}", date.format("%Y-%m-%d"))
+                            }
+                            _ => String::new(),
+                        }
+                    )),
+                    PreviewFolderRow::Header { .. } => None,
+                })
         })
     }
     .unwrap_or_else(|| format!("Archive: {}", plan.archive.display()));
@@ -799,6 +932,30 @@ fn done(frame: &mut Frame, app: &App, area: Rect) {
     ];
     if app.completed_archive().is_some() {
         lines.push(Line::from("  Press o to open the archive folder."));
+        let archive = app.completed_archive().unwrap();
+        let relative = |path: &std::path::Path| {
+            path.strip_prefix(archive)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        };
+        if let Some(folder) = app.created_folder() {
+            lines.push(Line::from(vec![
+                Span::raw("  Press f to open the new folder: "),
+                Span::styled(format!("{}/", relative(folder)), Style::default().fg(CYAN)),
+            ]));
+        }
+        if let Some(parent) = app.created_parent() {
+            let what = if app.created_folder().is_some() {
+                "its parent"
+            } else {
+                "the folder containing the new folders"
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  Press p to open {what}: ")),
+                Span::styled(format!("{}/", relative(&parent)), Style::default().fg(CYAN)),
+            ]));
+        }
     }
     if summary.failed > 0 {
         lines.push(Line::from(""));
@@ -833,18 +990,54 @@ fn popup(frame: &mut Frame, width: u16, height: u16) -> Rect {
     rect
 }
 
+fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
+    if count == 1 { one } else { many }
+}
+
 fn confirmation(frame: &mut Frame, app: &App) {
     let Some(plan) = &app.plan else { return };
-    let area = popup(frame, 76, 15);
+    let folders_to_fill = plan
+        .folders()
+        .iter()
+        .filter(|folder| folder.included && folder.copy > 0)
+        .count();
+    let new_folders = plan
+        .new_folder_layouts()
+        .len()
+        .saturating_sub(plan.excluded.len());
+    let area = popup(frame, 76, 16);
     let lines = vec![
         Line::from(""),
         Line::from(format!(
-            "  Copy {} photos ({}) into {} folders?",
+            "  Copy {} {} ({}) into {} {}?",
             plan.copy_count(),
+            plural(plan.copy_count(), "photo", "photos"),
             human_bytes(plan.bytes()),
-            plan.folders().iter().filter(|folder| folder.copy > 0).count()
+            folders_to_fill,
+            plural(folders_to_fill, "folder", "folders"),
         )),
         Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "  {} new {} will be created{}",
+                new_folders,
+                plural(new_folders, "folder", "folders"),
+                if plan.excluded_count() > 0 {
+                    format!(
+                        " · {} {} in unselected folders left out",
+                        plan.excluded_count(),
+                        plural(plan.excluded_count(), "photo", "photos")
+                    )
+                } else {
+                    String::new()
+                }
+            ),
+            if plan.excluded_count() > 0 {
+                Style::default().fg(YELLOW)
+            } else {
+                muted()
+            },
+        )),
         Line::from(format!("  From: {}", plan.source.display())),
         Line::from(format!("  To:   {}", plan.archive.display())),
         Line::from(""),
@@ -890,6 +1083,7 @@ fn custom_folder_dialog(frame: &mut Frame, app: &App) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(5),
+        Constraint::Length(1),
         Constraint::Length(if choosing { list_height } else { 0 }),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -901,12 +1095,12 @@ fn custom_folder_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(custom_folder_scope_line(app), chunks[0]);
     let (blurb, clear_hint) = match app.custom_folder_scope {
         CustomFolderScope::SelectedFolder => (
-            "Inserts a folder under year/month for the checked new folders only. Existing folders stay unchanged:",
-            "↑↓ move · Space check/uncheck · x removes an applied custom name.",
+            "Inserts a folder under year/month for the selected new folders only. Existing folders stay unchanged:",
+            "↑↓ move · Tab select/deselect · Ctrl+X removes an applied custom name.",
         ),
         CustomFolderScope::AllNewFolders => (
             "Inserts the same folder under year/month for every new folder that will be created. Existing folders stay unchanged:",
-            "Press x to remove an applied custom name.",
+            "Press Ctrl+X to remove an applied custom name.",
         ),
     };
     frame.render_widget(
@@ -918,41 +1112,38 @@ fn custom_folder_dialog(frame: &mut Frame, app: &App) {
         .wrap(Wrap { trim: false }),
         chunks[1],
     );
+    frame.render_widget(Paragraph::new(custom_folder_applied_line(app)), chunks[2]);
     if choosing {
-        frame.render_widget(custom_folder_picker(app), chunks[2]);
+        frame.render_widget(custom_folder_picker(app), chunks[3]);
     }
-    frame.render_widget(Paragraph::new("Folder name:").style(muted()), chunks[3]);
+    frame.render_widget(Paragraph::new("Folder name:").style(muted()), chunks[4]);
     let chars: Vec<_> = app.custom_folder_input.as_ref().unwrap().chars().collect();
-    let available = chunks[4].width.saturating_sub(1) as usize;
+    let available = chunks[5].width.saturating_sub(1) as usize;
     let input: String = chars[chars.len().saturating_sub(available)..]
         .iter()
         .collect();
     frame.render_widget(
         Paragraph::new(format!("{input}▏")).style(accent().bg(SELECTED)),
-        chunks[4],
+        chunks[5],
     );
-    let error = if app.error {
-        app.message.as_str()
-    } else {
-        ""
-    };
+    let error = if app.error { app.message.as_str() } else { "" };
     frame.render_widget(
         Paragraph::new(error)
             .style(Style::default().fg(RED))
             .wrap(Wrap { trim: false }),
-        chunks[5],
+        chunks[6],
     );
     let footer = if choosing {
         Line::from(vec![
             Span::styled("[←→]", accent().bg(SELECTED)),
-            Span::raw(" Scope  "),
+            Span::raw(" Switch scope  "),
             Span::styled("[↑↓]", accent().bg(SELECTED)),
             Span::raw(" List  "),
-            Span::styled("[Space]", accent().bg(SELECTED)),
-            Span::raw(" Check  "),
+            Span::styled("[Tab]", accent().bg(SELECTED)),
+            Span::raw(" Select  "),
             Span::styled("[Enter]", accent().bg(SELECTED)),
             Span::raw(" Apply  "),
-            Span::styled("[x]", accent().bg(SELECTED)),
+            Span::styled("[Ctrl+X]", accent().bg(SELECTED)),
             Span::raw(" Remove  "),
             Span::styled("[Esc]", accent().bg(SELECTED)),
             Span::raw(" Back"),
@@ -960,19 +1151,40 @@ fn custom_folder_dialog(frame: &mut Frame, app: &App) {
     } else {
         Line::from(vec![
             Span::styled("[←→]", accent().bg(SELECTED)),
-            Span::raw(" Scope  "),
+            Span::raw(" Switch scope  "),
             Span::styled("[Enter]", accent().bg(SELECTED)),
             Span::raw(" Apply  "),
-            Span::styled("[x]", accent().bg(SELECTED)),
+            Span::styled("[Ctrl+X]", accent().bg(SELECTED)),
             Span::raw(" Remove  "),
             Span::styled("[Esc]", accent().bg(SELECTED)),
             Span::raw(" Back"),
         ])
     };
-    frame.render_widget(
-        Paragraph::new(footer).wrap(Wrap { trim: false }),
-        chunks[6],
-    );
+    frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), chunks[7]);
+}
+
+/// What is applied to the preview right now, so unapplied typing is never mistaken for it.
+fn custom_folder_applied_line(app: &App) -> Line<'static> {
+    let typed = app.custom_folder_input.as_deref().unwrap_or("").trim();
+    match &app.segment_insert {
+        Some(insert) => {
+            let mut spans = vec![
+                Span::styled("Applied now: ", muted()),
+                Span::styled(
+                    format!("{}/", insert.name()),
+                    Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if typed != insert.name() {
+                spans.push(Span::styled(
+                    "  · your edit isn't applied until you press Enter (Esc discards it)",
+                    muted(),
+                ));
+            }
+            Line::from(spans)
+        }
+        None => Line::from(Span::styled("Applied now: no custom folder", muted())),
+    }
 }
 
 fn custom_folder_scope_line(app: &App) -> Paragraph<'static> {
@@ -986,6 +1198,7 @@ fn custom_folder_scope_line(app: &App) -> Paragraph<'static> {
     };
     Paragraph::new(Line::from(vec![
         Span::styled("Scope: ", muted()),
+        Span::styled("← ", accent()),
         Span::styled(
             " Choose folders ",
             chip(scope == CustomFolderScope::SelectedFolder),
@@ -995,18 +1208,17 @@ fn custom_folder_scope_line(app: &App) -> Paragraph<'static> {
             " All new folders ",
             chip(scope == CustomFolderScope::AllNewFolders),
         ),
+        Span::styled(" →", accent()),
+        Span::styled("   Use ← → to switch", muted()),
     ]))
 }
 
 fn custom_folder_picker(app: &App) -> Paragraph<'static> {
     if app.custom_folder_choices.is_empty() {
-        return Paragraph::new(Span::styled(
-            "No new folders in this preview.",
-            muted(),
-        ));
+        return Paragraph::new(Span::styled("No new folders in this preview.", muted()));
     }
     let mut lines = vec![Line::from(Span::styled(
-        "New folders · Space to include:",
+        "New folders · Tab to select:",
         muted(),
     ))];
     for (index, path) in app.custom_folder_choices.iter().enumerate() {
@@ -1033,11 +1245,7 @@ fn custom_folder_picker(app: &App) -> Paragraph<'static> {
 }
 
 fn custom_folder_example(app: &App) -> Line<'static> {
-    let typed = app
-        .custom_folder_input
-        .as_deref()
-        .unwrap_or("")
-        .trim();
+    let typed = app.custom_folder_input.as_deref().unwrap_or("").trim();
     let name = if typed.is_empty() {
         "<CUSTOM FOLDER NAME>"
     } else {
@@ -1104,7 +1312,7 @@ fn directory_dialog(frame: &mut Frame, app: &mut App) {
         "Browse archive folders"
     };
     let screen = frame.area();
-    let footer_height = shortcut_lines(app, screen.width.saturating_sub(2)).len() as u16;
+    let footer_height = shortcut_lines(app, screen.width.saturating_sub(2), false).len() as u16;
     let available_height = screen.height.saturating_sub(footer_height + 1);
     let width = 90.min(screen.width.saturating_sub(4));
     let height = 26.min(available_height.saturating_sub(2));

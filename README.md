@@ -68,7 +68,7 @@ Then run `shotctl`. A new terminal alone is not enough — the installed binary 
 1. Choose an archive directory. Type part of a path and press `Tab` to complete folder names, or press `Enter` / `Ctrl+B` to browse folders visually. An absolute path or `~/` works; saving creates the directory if needed.
 2. Pick a folder structure, photo grouping, and date basis. The header and examples update as you edit. Press `Ctrl+S` to save.
 3. Select your card. Mounted volumes with a `DCIM` folder are detected on macOS and Linux; press `r` after connecting one. Press `s` to choose any photo directory manually.
-4. Press `Enter` to scan. Review exact destination folders, file counts, duplicate skips, renamed conflicts, and metadata fallbacks. Press `f` to inspect individual destination files and their source paths.
+4. Press `Enter` to scan. Review exact destination folders, file counts, duplicate skips, renamed conflicts, and metadata fallbacks. Press `f` to inspect individual destination files and their source paths. Folders already in the archive also show an **IMPORTED** date, the day the folder was created (when photos first arrived in it), on terminals at least 78 columns wide and where the filesystem records creation dates; the highlighted folder's date also appears in the detail line below the table.
 5. Press `Enter`, then `Enter` or `y` in the confirmation dialog to import. Follow progress and review the completion summary.
 
 After a successful import, press `o` to open the archive folder in your system's file manager and browse the newly created import folders.
@@ -111,12 +111,20 @@ The month preset intentionally shares month folders across years; the full date 
 | `r` | Refresh detected cards; rescan from a preview |
 | `c` | Edit configuration |
 | `f` / `Tab` | Switch between folder and file previews |
-| `o` | Open the archive folder after a successful import |
+| `o` | In the folder preview, open the highlighted folder if it is already in the archive; after a successful import, open the archive folder |
+| `f` | After a successful import that created one new folder, open that folder |
+| `p` | After a successful import, open the folder containing the new folders (the parent of a single new folder, or the one shared by several) |
+| `Space` | In the folder preview, select or deselect the highlighted new folder |
+| `a` | In the folder preview, select all new folders, or deselect them all if every one is already selected |
 | `PageUp` / `PageDown` | Scroll a preview by ten rows |
 | `?` | Open help |
 | `Esc` | Go back; close a dialog; cancel an active operation |
 | `q` | Quit; cancel when an operation is running |
 | `Ctrl+C` | Quit; safely cancel an active operation |
+
+**Choosing which new folders to create.** By default every folder listed under *New folders* is created. In the folder preview, each new folder has a checkbox: press `Space` to deselect the highlighted folder (`[ ]`) or select it again (`[x]`), or press `a` to deselect all new folders at once and `a` again to select them all. Photos belonging to a deselected folder are not copied, and the totals and confirmation dialog update to match. Existing folders are always used and can't be deselected. Selections apply to the current preview; rescanning selects every new folder again.
+
+**Custom folder.** Press `n` in the folder preview to insert a one-time folder name under the layout's parent folders (for example `2026/10/demo-trip/2026-10-12-RAW/`). The dialog's two scopes, *Choose folders* and *All new folders*, switch with `←` / `→`. Every printable key, including `x` and `Space`, types into the name. In *Choose folders*, use `↑` / `↓` to move, `Tab` to select or deselect a folder, `Enter` to apply, `Ctrl+X` to remove an applied name, and `Esc` to close without applying. The header's example path and the dialog's "Applied now" line show what is currently applied. A custom folder belongs to the current preview and is forgotten when you leave it with `Esc`.
 
 In configuration, use `↑` / `↓` or `Shift+Tab` to select a field, `←` / `→` / `Enter` to cycle options, and `Ctrl+S` to save. `Tab` moves forward from option fields; in the archive path it completes directory names. Text fields append characters; `Backspace` deletes and `Ctrl+U` clears. On first launch, `Esc` exits without saving.
 
@@ -131,7 +139,8 @@ Press `n` in the browser to create a new folder inside the current directory. En
 - Recursively scans regular photo files. Supports JPEG, common RAW extensions (including ARW, CR2, CR3, DNG, NEF, ORF, RAF, RW2), HEIF, TIFF, and PNG. Other files, videos, sidecars, and symlinks are ignored and counted in the preview.
 - Skips known system folders such as macOS `.Trashes`, `.Spotlight-V100`, and `.fseventsd`, and Windows `$RECYCLE.BIN` and `System Volume Information`, before reading their contents. Each skipped folder counts as one ignored entry. Ordinary hidden photo folders are scanned; unreadable photo folders still report an error.
 - Copies photos and preserves their modification times. Originals are kept on the source.
-- Compares BLAKE3 hashes at each proposed destination. Identical files at that destination are skipped, including duplicates within the same import. This is destination-based deduplication; changing the date basis or folder settings can create another copy elsewhere.
+- Compares BLAKE3 hashes at each proposed destination. Identical files at that destination are skipped, including duplicates within the same import. This is destination-based deduplication, with one extension: if the destination folder has no such file, the matching folders one level down under a custom name (`2026/10/<name>/2026-10-21-RAW` for `2026/10/2026-10-21-RAW`) are checked too, so photos imported earlier with a custom folder show up as duplicates in the existing folders. Changing the date basis or other folder settings can still create another copy elsewhere.
+- Keeps the preview fast. Capture dates in TIFF-based raw files (DNG, ARW, NEF, CR2 and similar) are read from the few bytes of metadata that hold them, not by loading the whole file. Only photos whose name and size already exist at the destination are hashed, several at a time. The hashes are remembered in `hash-cache.tsv` next to the configuration file, so reinserting a card you have imported before does not re-read photos that have not changed. A remembered hash is used only while the file's size and modification time are unchanged; delete `hash-cache.tsv` at any time to force full re-checking.
 - Keeps conflicting contents by adding a stable 12-character content hash to the incoming filename, with a counter if necessary. Exact renamed destinations are shown in the preview.
 - Writes to a temporary file inside the destination folder, verifies the copied content against the preview's hash, then publishes without overwriting. If a source or destination changes after preview, the affected import fails safely and is reported.
 - Scanning and copying run in background threads. Cancelling removes the current temporary file and keeps completed photos. Empty directories may remain. A force kill or power loss can leave a `.shotctl-*.partial` file; it is never treated as a completed photo.
