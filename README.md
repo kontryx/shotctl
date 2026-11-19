@@ -2,6 +2,8 @@
 
 A fast, keyboard-driven terminal app for importing photos from your SD card. Preview exactly where every photo will land, skip duplicates, and import with confidence.
 
+![shotctl demo: configure, select a card, review folders, and import](docs/demo/demo.gif)
+
 ## Install with Homebrew
 
 On macOS or Linux with [Homebrew](https://brew.sh):
@@ -100,8 +102,17 @@ Then run `shotctl`. A new terminal alone is not enough — the installed binary 
 ## Your first import
 
 1. Choose an archive directory. Type part of a path and press `Tab` to complete folder names, or press `Enter` / `Ctrl+B` to browse folders visually. An absolute path or `~/` works; saving creates the directory if needed.
+
+   ![Browse archive folders](docs/demo/browse-archive.png)
+
 2. Pick a folder structure, photo grouping, and date basis. The header and examples update as you edit. Press `Ctrl+S` to save.
+
+   ![Edit configuration](docs/demo/configure.png)
+
 3. Select your card. Mounted volumes with a `DCIM` folder are detected on macOS and Linux; press `r` after connecting one. Press `s` to choose any photo directory manually.
+
+   ![Select a source card](docs/demo/select-source.png)
+
 4. Press `Enter` to scan. Review exact destination folders, file counts, duplicate skips, renamed conflicts, and metadata fallbacks. Press `f` to inspect individual destination files and their source paths. Folders already in the archive also show an **IMPORTED** date, the day the folder was created (when photos first arrived in it), on terminals at least 78 columns wide and where the filesystem records creation dates; the highlighted folder's date also appears in the detail line below the table.
 5. Press `Enter`, then `Enter` or `y` in the confirmation dialog to import. Follow progress and review the completion summary.
 
