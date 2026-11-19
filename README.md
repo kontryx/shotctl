@@ -11,7 +11,7 @@ brew install kontryx/tap/shotctl
 shotctl
 ```
 
-Upgrade later with `brew upgrade shotctl`.
+To update later, see [How to update Shotctl](#how-to-update-shotctl).
 
 ## Run from source
 
@@ -65,7 +65,30 @@ Use an interactive terminal, preferably 100 columns × 32 rows or larger. Smalle
 
 ## How to update Shotctl
 
-If you installed with Homebrew, run `brew upgrade shotctl`. For a source install, after pulling new changes, rebuild and reinstall from the project directory:
+### Homebrew
+
+1. Quit shotctl if it is running (`q`).
+2. Fetch the latest formulas, then upgrade:
+
+   ```sh
+   brew update
+   brew upgrade shotctl
+   ```
+
+3. Confirm the new version, then start shotctl again:
+
+   ```sh
+   shotctl --version
+   shotctl
+   ```
+
+Your configuration, archive, and hash cache are kept; upgrading only replaces the program. See [releases](https://github.com/kontryx/shotctl/releases) for what changed in each version.
+
+If `shotctl --version` still shows the old version, another copy earlier in your PATH is running instead. `which -a shotctl` lists every copy; the Homebrew one is `/opt/homebrew/bin/shotctl` on Apple Silicon Macs (`/usr/local/bin/shotctl` on Intel Macs). Remove the others, for example `rm ~/.local/bin/shotctl` for a copy from `scripts/install.sh`, then run `hash -r` or open a new terminal.
+
+### Source install
+
+After pulling new changes, rebuild and reinstall from the project directory:
 
 ```sh
 source "$HOME/.cargo/env"
