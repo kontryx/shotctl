@@ -8,7 +8,7 @@ use chrono::{Local, NaiveDate, TimeZone};
 use tempfile::TempDir;
 
 use crate::{
-    config::{Config, DateBasis, Grouping, Layout},
+    config::{Config, DateBasis, Grouping, Layout, Theme},
     import::{self, Action, Plan, WorkerEvent},
     media,
 };
@@ -466,6 +466,7 @@ fn configuration_persists_and_creates_archive() {
         layout: Layout::YearMonthDate,
         grouping: Grouping::Together,
         date_basis: DateBasis::Import,
+        theme: Theme::Light,
     };
     config.save(&path).unwrap();
     let loaded = Config::load(&path).unwrap().unwrap();
@@ -473,6 +474,15 @@ fn configuration_persists_and_creates_archive() {
     assert_eq!(loaded.layout, config.layout);
     assert_eq!(loaded.grouping, config.grouping);
     assert_eq!(loaded.date_basis, config.date_basis);
+    assert_eq!(loaded.theme, Theme::Light);
+}
+
+#[test]
+fn configurations_without_a_theme_use_the_dark_theme() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("config.toml");
+    fs::write(&path, "archive = \"/example-archive\"\nlayout = \"date\"\n").unwrap();
+    assert_eq!(Config::load(&path).unwrap().unwrap().theme, Theme::Dark);
 }
 
 #[cfg(unix)]
@@ -566,6 +576,10 @@ fn terminal_screens_keep_configuration_and_setup_controls_visible() {
                     "Save control hidden at {width}×{height}:\n{text}"
                 );
                 assert!(text.contains("Organize by"));
+                assert!(
+                    text.contains("‹ Dark ›"),
+                    "Theme hidden at {width}×{height}"
+                );
             }
             if screen == Screen::Preview {
                 let relative = app.plan.as_ref().unwrap().photos[0]

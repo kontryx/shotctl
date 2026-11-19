@@ -48,15 +48,17 @@ pub fn preview_folder_rows(plan: &Plan) -> Vec<PreviewFolderRow> {
     rows
 }
 
-const BG: Color = Color::Rgb(15, 20, 29);
-const PANEL: Color = Color::Rgb(20, 28, 39);
-const TEXT: Color = Color::Rgb(214, 225, 238);
-const MUTED: Color = Color::Rgb(135, 154, 176);
-const CYAN: Color = Color::Rgb(91, 214, 231);
-const GREEN: Color = Color::Rgb(134, 218, 165);
-const YELLOW: Color = Color::Rgb(241, 203, 117);
-const RED: Color = Color::Rgb(248, 132, 132);
-const SELECTED: Color = Color::Rgb(34, 57, 74);
+// The dark theme. `theme::apply` maps these to the light theme after drawing.
+pub const BG: Color = Color::Rgb(15, 20, 29);
+pub const PANEL: Color = Color::Rgb(20, 28, 39);
+pub const TEXT: Color = Color::Rgb(214, 225, 238);
+pub const MUTED: Color = Color::Rgb(135, 154, 176);
+pub const CYAN: Color = Color::Rgb(91, 214, 231);
+pub const GREEN: Color = Color::Rgb(134, 218, 165);
+pub const YELLOW: Color = Color::Rgb(241, 203, 117);
+pub const RED: Color = Color::Rgb(248, 132, 132);
+pub const SELECTED: Color = Color::Rgb(34, 57, 74);
+pub const BORDER: Color = Color::Rgb(57, 80, 101);
 
 fn accent() -> Style {
     Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
@@ -68,7 +70,7 @@ fn border(title: &str) -> Block<'_> {
     Block::default()
         .title(format!(" {title} "))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(57, 80, 101)))
+        .border_style(Style::default().fg(BORDER))
         .title_style(accent())
         .style(Style::default().bg(PANEL).fg(TEXT))
 }
@@ -434,7 +436,7 @@ fn settings(frame: &mut Frame, app: &App, area: Rect) {
     let compact = inner.height < 15;
     let chunks = Layout::vertical([
         Constraint::Length(if compact { 0 } else { 2 }),
-        Constraint::Length(5),
+        Constraint::Length(6),
         Constraint::Min(1),
     ])
     .horizontal_margin(1)
@@ -462,6 +464,7 @@ fn settings(frame: &mut Frame, app: &App, area: Rect) {
         ("Folder structure", format!("‹ {} ›", app.draft.layout)),
         ("Photo grouping", format!("‹ {} ›", app.draft.grouping)),
         ("Organize by", format!("‹ {} ›", app.draft.date_basis)),
+        ("Theme", format!("‹ {} ›", app.draft.theme)),
         ("", "Save configuration & continue".into()),
     ];
     let rows: Vec<_> = values

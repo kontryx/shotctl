@@ -18,7 +18,7 @@ use crate::{
     config::{Config, DateBasis, expand_path},
     directories::{self, Completion, DirectoryBrowser},
     import::{self, FolderSummary, Plan, ScanCache, SegmentInsert, Summary, WorkerEvent},
-    media, ui,
+    media, theme, ui,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -166,9 +166,18 @@ impl App {
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let color_mode = theme::ColorMode::detect();
         while !self.quit {
             self.poll_worker();
-            terminal.draw(|frame| ui::draw(frame, self))?;
+            let shown_theme = if self.screen == Screen::Settings {
+                self.draft.theme
+            } else {
+                self.config.theme
+            };
+            terminal.draw(|frame| {
+                ui::draw(frame, self);
+                theme::apply(frame.buffer_mut(), shown_theme, color_mode);
+            })?;
             if event::poll(Duration::from_millis(100))?
                 && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
@@ -1102,9 +1111,9 @@ impl App {
                 }
             }
             KeyCode::Tab if self.field == 0 => self.complete_directory(),
-            KeyCode::Tab | KeyCode::Down => self.field = (self.field + 1) % 5,
-            KeyCode::BackTab | KeyCode::Up => self.field = (self.field + 4) % 5,
-            KeyCode::Enter if self.field == 4 => self.save_settings(),
+            KeyCode::Tab | KeyCode::Down => self.field = (self.field + 1) % 6,
+            KeyCode::BackTab | KeyCode::Up => self.field = (self.field + 5) % 6,
+            KeyCode::Enter if self.field == 5 => self.save_settings(),
             KeyCode::Enter if self.field == 0 => self.browse_directory(),
             KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
                 if self.field > 0 =>
@@ -1130,6 +1139,7 @@ impl App {
                             DateBasis::Import => DateBasis::Capture,
                         }
                     }
+                    4 => self.draft.theme = self.draft.theme.next(),
                     _ => {}
                 }
             }

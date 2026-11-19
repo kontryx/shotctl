@@ -173,12 +173,16 @@ archive = "/example-archive"
 layout = "month_date"
 grouping = "separate"
 date_basis = "capture"
+theme = "dark"
 ```
+
+`theme` is `dark` (the default) or `light`. You can also change it under **Theme** in the configuration screen (`c`), which previews it as you switch.
 
 The Rust modules separate configuration, media detection and metadata, import planning and copying, application state, and rendering.
 
 ## Troubleshooting
 
+- **Colors look wrong.** shotctl draws its own colors and background, so terminal themes don't change it. Terminals with 24-bit color (macOS 26 Terminal, iTerm2, Ghostty, WezTerm, kitty, and others) show the exact theme. Others, including Terminal on macOS 15 and earlier, get the closest colors from the standard 256-color palette. If detection guesses wrong, set `SHOTCTL_COLOR=truecolor` or `SHOTCTL_COLOR=256`, for example `SHOTCTL_COLOR=256 shotctl`.
 - **Terminal too small.** Prefer at least 100×32; layouts work down to 66×22. Enlarge the window if controls look clipped.
 - **Card not listed.** Press `r` after mounting, or press `s` and choose the photo directory. Automatic detection looks for a `DCIM` folder on mounted volumes (macOS/Linux) or drive letters (Windows).
 - **Unexpected duplicates or missing skips.** Deduplication is destination-based. Changing layout, grouping, or date basis can place the same photo in a new folder. Delete `hash-cache.tsv` next to the config file to force full re-hashing.

@@ -1,13 +1,12 @@
 [package]
 name = "shotctl"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A keyboard-driven photo import and archive manager"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/kontryx/shotctl"
-homepage = "https://github.com/kontryx/shotctl"
 authors = ["kontryx <konbog@protonmail.com>"]
 keywords = ["photos", "import", "tui", "camera", "archive"]
 categories = ["command-line-utilities", "multimedia"]

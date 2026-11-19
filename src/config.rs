@@ -93,6 +93,32 @@ impl fmt::Display for DateBasis {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        }
+    }
+}
+
+impl fmt::Display for Theme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -100,6 +126,7 @@ pub struct Config {
     pub layout: Layout,
     pub grouping: Grouping,
     pub date_basis: DateBasis,
+    pub theme: Theme,
 }
 
 impl Default for Config {
@@ -112,6 +139,7 @@ impl Default for Config {
             layout: Layout::default(),
             grouping: Grouping::default(),
             date_basis: DateBasis::default(),
+            theme: Theme::default(),
         }
     }
 }

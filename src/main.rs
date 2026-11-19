@@ -3,6 +3,7 @@ mod config;
 mod directories;
 mod import;
 mod media;
+mod theme;
 mod ui;
 
 #[cfg(test)]
